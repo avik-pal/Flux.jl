@@ -174,8 +174,10 @@ end
 # Hacks to get std working
 Base.std(x::TrackedArray; mean = Base.mean(x)) =
   sqrt.(sum((x .- mean).^2) ./ (length(x)-1))
-Base.std(x::TrackedArray, dim; mean = Base.mean(x, dim)) =
+Base.std(x::TrackedArray, dim::Int; mean = Base.mean(x, dim)) =
   sqrt.(sum((x .- mean).^2, dim) ./ (size(x, dim)-1))
+Base.std(x::TrackedArray, dim::Array; mean = Base.mean(x, dim)) =
+  sqrt.(sum((x .- mean).^2, dim) ./ (prod(size(x)[dim])-1))
 
 Base.vecnorm(x::TrackedArray, p::Real = 2) =
   sum(abs.(x).^p .+ eps(0f0))^(1/p) # avoid d(sqrt(x))/dx == Inf at 0
