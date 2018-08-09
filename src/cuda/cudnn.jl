@@ -3,23 +3,23 @@ using CuArrays.CUDNN: @check, libcudnn, cudnnStatus_t, cudnnTensorDescriptor_t,
 import ..Flux: data
 
 mutable struct DropoutDesc
-  ptr::Ptr{Void}
+  ptr::Ptr{Nothing}
   states::CuVector{UInt8}
 end
 
-Base.unsafe_convert(::Type{Ptr{Void}}, dd::DropoutDesc) = dd.ptr
+Base.unsafe_convert(::Type{Ptr{Nothing}}, dd::DropoutDesc) = dd.ptr
 
 function DropoutDesc(ρ::Real; seed::Integer=0)
   d = [C_NULL]
   s = Csize_t[0]
-  @check ccall((:cudnnCreateDropoutDescriptor,libcudnn), cudnnStatus_t, (Ptr{Ptr{Void}},), d)
-  @check ccall((:cudnnDropoutGetStatesSize,libcudnn),cudnnStatus_t,(Ptr{Void},Ptr{Csize_t}),libcudnn_handle[],s)
+  @check ccall((:cudnnCreateDropoutDescriptor,libcudnn), cudnnStatus_t, (Ptr{Ptr{Nothing}},), d)
+  @check ccall((:cudnnDropoutGetStatesSize,libcudnn),cudnnStatus_t,(Ptr{Nothing},Ptr{Csize_t}),libcudnn_handle[],s)
   states = CuArray{UInt8}(s[]) # TODO: can we drop this when ρ=0?
   desc = DropoutDesc(d[], states)
-  @check ccall((:cudnnSetDropoutDescriptor,libcudnn),cudnnStatus_t,(Ptr{Void},Ptr{Void},Cfloat,Ptr{Void},Csize_t,Culonglong),
+  @check ccall((:cudnnSetDropoutDescriptor,libcudnn),cudnnStatus_t,(Ptr{Nothing},Ptr{Nothing},Cfloat,Ptr{Nothing},Csize_t,Culonglong),
     desc,libcudnn_handle[],ρ,states,length(states),seed)
   finalizer(desc, x ->
-    @check ccall((:cudnnDestroyDropoutDescriptor,libcudnn),cudnnStatus_t,(Ptr{Void},),x))
+    @check ccall((:cudnnDestroyDropoutDescriptor,libcudnn),cudnnStatus_t,(Ptr{Nothing},),x))
   return desc
 end
 
@@ -209,3 +209,60 @@ batchnorm(g::CuArray{T}, b::CuArray{T}, x::TrackedArray, running_mean::CuArray{T
 
 @grad batchnorm(g, b, x, running_mean, running_var, momentum; kw...) =
   batchnorm(data.((g, b, x))..., running_mean, running_var, momentum; kw...), Δ -> (nobacksies(:batchnorm, ∇batchnorm(data.((g, b, x, Δ))..., running_mean, running_var, momentum; kw...))..., nothing, nothing, nothing)
+
+using NNlib: padtuple, cdims, dilation_dims, conv, ∇conv_data, ∇conv_filter
+using CuArrays.CUDNN: cudnnConvolutionBackwardBias, cudnnConvolutionBackwardData, cudnnConvolutionBackwardFilter,
+  cudnnActivationBackward,  cudnnConvolutionBiasActivationForward, cudnnAddTensor
+
+function convbias!(y::CuArray{T}, x::CuArray{T}, w::CuArray{T}, b::CuArray{T};
+                   pad = 0, stride = 1, mode = 0,
+                   alpha = 1, dilation = 1, activationMode = 5) where T<:Union{Float32,Float64}
+  all(x -> x == 1, dilation) || error("Only dilation = 1 is supported in CuArrays")
+  cudnnConvolutionBiasActivationForward(y, x, w, b, padding=pad, stride=stride, mode=mode, alpha1=alpha, activationMode=activationMode)
+end
+
+function convbias(x::CuArray{T}, w::CuArray{T}, b::CuArray{T};
+                  pad = 0, stride = 1, mode = 0,
+                  alpha = 1, dilation = 1) where T<:Union{Float32,Float64}
+  pad_, stride_ = padtuple(x, pad), padtuple(x, stride)
+  convbias!(similar(x, cdims(size(x), dilation_dims(w, dilation), pad_, stride_)),
+            x, w, b, pad = pad_, stride = stride_, dilation = dilation, activationMode = 5)
+end
+
+∇conv_bias(Δ::CuArray{T}, b::CuArray{T}; pad = 0, beta = 0,
+           stride = 1, mode = 0, alpha = 1, dilation = 1) where T<:Union{Float32,Float64} =
+  reshape(cudnnConvolutionBackwardBias(similar(b), Δ, alpha=alpha, beta=beta), :)
+
+function (m::Flux.Conv)(x::Union{CuParam{T,4},CuParam{T,5}})  where T<:Union{Float32,Float64}
+  # Will cause a problem in cudnn version < 7.1 if none of x, weight and bias are tracked
+  result = convbias(x, m.weight, m.bias, pad = m.pad, stride = m.stride, dilation = m.dilation)
+  m.σ == identity ? result : m.σ.(result) # Replace with cudnn function calls
+end
+
+convbias(x::TrackedArray, w::TrackedArray, b::TrackedArray; kw...) = track(convbias, x, w, b; kw...)
+
+convbias(x::CuArray{T}, w::TrackedArray, b::TrackedArray; kw...) where T<:Union{Float32,Float64} =
+  track(convbias, x, w, b; kw...)
+
+convbias(x::CuArray{T}, w::CuArray{T}, b::TrackedArray; kw...) where T<:Union{Float32,Float64} =
+  track(convbias, x, w, b; kw...)
+
+convbias(x::TrackedArray, w::CuArray{T}, b::TrackedArray; kw...) where T<:Union{Float32,Float64} =
+  track(convbias, x, w, b; kw...)
+
+convbias(x::TrackedArray, w::TrackedArray, b::CuArray{T}; kw...) where T<:Union{Float32,Float64} =
+  track(convbias, x, w, b; kw...)
+
+convbias(x::CuArray{T}, w::TrackedArray, b::CuArray{T}; kw...) where T<:Union{Float32,Float64} =
+  track(convbias, x, w, b; kw...)
+
+convbias(x::TrackedArray, w::CuArray{T}, b::CuArray{T}; kw...) where T<:Union{Float32,Float64} =
+  track(convbias, x, w, b; kw...)
+
+@grad function convbias(x, w, b; kw...)
+  bias = reshape(b, map(_->1, kw[2][2])..., :, 1)
+  CUDNN_VERSION >= 7100 ? convbias(data.((x, w, bias))...; kw...) : cudnnAddTensor(data(bias), conv(data.((x, w))...; kw...)),
+    Δ -> (istracked(x) ? ∇conv_data(data.((Δ, x, w))...; kw...) : nothing,
+          istracked(w) ? ∇conv_filter(data.((Δ, x, w))...; kw...) : nothing,
+          istracked(b) ? ∇conv_bias(data.((Δ, bias))...; kw...) : nothing)
+end
