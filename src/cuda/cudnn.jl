@@ -181,31 +181,31 @@ end
 
 batchnorm(g::TrackedArray, b::TrackedArray, x::TrackedArray, running_mean::CuArray{T},
           running_var::CuArray{T}, momentum; kw...) where T<:Union{Float32, Float64} =
-  track(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
+  track_kw(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
 
 batchnorm(g::TrackedArray, b::TrackedArray, x::CuArray{T}, running_mean::CuArray{T},
           running_var::CuArray{T}, momentum; kw...) where T<:Union{Float32, Float64} =
-  track(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
+  track_kw(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
 
 batchnorm(g::TrackedArray, b::CuArray{T}, x::TrackedArray, running_mean::CuArray{T},
           running_var::CuArray{T}, momentum; kw...) where T<:Union{Float32, Float64} =
-  track(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
+  track_kw(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
 
 batchnorm(g::CuArray{T}, b::TrackedArray, x::CuArray{T}, running_mean::CuArray{T},
           running_var::CuArray{T}, momentum; kw...) where T<:Union{Float32, Float64} =
-  track(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
+  track_kw(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
 
 batchnorm(g::CuArray{T}, b::TrackedArray, x::TrackedArray, running_mean::CuArray{T},
           running_var::CuArray{T}, momentum; kw...) where T<:Union{Float32, Float64} =
-  track(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
+  track_kw(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
 
 batchnorm(g::TrackedArray, b::CuArray{T}, x::CuArray{T}, running_mean::CuArray{T},
           running_var::CuArray{T}, momentum; kw...) where T<:Union{Float32, Float64} =
-  track(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
+  track_kw(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
 
 batchnorm(g::CuArray{T}, b::CuArray{T}, x::TrackedArray, running_mean::CuArray{T},
           running_var::CuArray{T}, momentum; kw...) where T<:Union{Float32, Float64} =
-  track(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
+  track_kw(batchnorm, g, b, x, running_mean, running_var, momentum; kw...)
 
 @grad batchnorm(g, b, x, running_mean, running_var, momentum; kw...) =
   batchnorm(data.((g, b, x))..., running_mean, running_var, momentum; kw...), Δ -> (nobacksies(:batchnorm, ∇batchnorm(data.((g, b, x, Δ))..., running_mean, running_var, momentum; kw...))..., nothing, nothing, nothing)
@@ -239,25 +239,25 @@ function (m::Flux.Conv)(x::Union{CuParam{T,4},CuParam{T,5}})  where T<:Union{Flo
   m.σ == identity ? result : m.σ.(result) # Replace with cudnn function calls
 end
 
-convbias(x::TrackedArray, w::TrackedArray, b::TrackedArray; kw...) = track(convbias, x, w, b; kw...)
+convbias(x::TrackedArray, w::TrackedArray, b::TrackedArray; kw...) = track_kw(convbias, x, w, b; kw...)
 
 convbias(x::CuArray{T}, w::TrackedArray, b::TrackedArray; kw...) where T<:Union{Float32,Float64} =
-  track(convbias, x, w, b; kw...)
+  track_kw(convbias, x, w, b; kw...)
 
 convbias(x::CuArray{T}, w::CuArray{T}, b::TrackedArray; kw...) where T<:Union{Float32,Float64} =
-  track(convbias, x, w, b; kw...)
+  track_kw(convbias, x, w, b; kw...)
 
 convbias(x::TrackedArray, w::CuArray{T}, b::TrackedArray; kw...) where T<:Union{Float32,Float64} =
-  track(convbias, x, w, b; kw...)
+  track_kw(convbias, x, w, b; kw...)
 
 convbias(x::TrackedArray, w::TrackedArray, b::CuArray{T}; kw...) where T<:Union{Float32,Float64} =
-  track(convbias, x, w, b; kw...)
+  track_kw(convbias, x, w, b; kw...)
 
 convbias(x::CuArray{T}, w::TrackedArray, b::CuArray{T}; kw...) where T<:Union{Float32,Float64} =
-  track(convbias, x, w, b; kw...)
+  track_kw(convbias, x, w, b; kw...)
 
 convbias(x::TrackedArray, w::CuArray{T}, b::CuArray{T}; kw...) where T<:Union{Float32,Float64} =
-  track(convbias, x, w, b; kw...)
+  track_kw(convbias, x, w, b; kw...)
 
 @grad function convbias(x, w, b; kw...)
   bias = reshape(b, map(_->1, kw[2][2])..., :, 1)
