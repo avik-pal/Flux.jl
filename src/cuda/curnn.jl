@@ -1,5 +1,5 @@
 using CuArrays.CUDNN: @check, libcudnn, cudnnStatus_t, cudnnTensorDescriptor_t,
-  cudnnBatchNormMode_t, cudnnHandle_t, libcudnn_handle, cudnnDataType, TensorDesc, FilterDesc
+  cudnnBatchNormMode_t, cudnnHandle_t, libcudnn_handle, cudnnDataType, TensorDesc, FilterDesc, CUDNN_VERSION
 
 const RNN_RELU = 0 # Stock RNN with ReLu activation
 const RNN_TANH = 1 # Stock RNN with tanh activation
