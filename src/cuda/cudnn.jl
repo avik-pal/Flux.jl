@@ -294,7 +294,7 @@ convbias(x::TrackedArray, w::TrackedArray, b::CuArray{T}; kw...) where T<:CUDNNF
   track(convbias, x, w, b; kw...)
 
 @grad function convbias(x, w, b; kw...)
-  bias = reshape(b, map(_->1, kw[2][2])..., :, 1)
+  bias = reshape(b, map(_->1, kw[2])..., :, 1)
   if version() >= v"7.1"
     y = convbias(data.((x, w, bias))...; kw...)
   else
