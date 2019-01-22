@@ -267,7 +267,7 @@ end
            stride = 1, mode = 0, alpha = 1, dilation = 1) where T<:CUDNNFloat =
   reshape(cudnnConvolutionBackwardBias(similar(b), Δ, alpha=alpha, beta=beta), :)
 
-(m::Flux.Conv)(x::Union{CuParam{T,4},CuParam{T,5}})  where T<:CUDNNFloat =
+(m::Flux.Conv{<:Any, <:Any, W})(x::Union{CuParam{T,4},CuParam{T,5}})  where {T<:CUDNNFloat, W<:CuParam} =
   m.σ.(convbias(x, m.weight, m.bias, pad = m.pad, stride = m.stride, dilation = m.dilation))
 
 convbias(x::TrackedArray, w::TrackedArray, b::TrackedArray; kw...) = track(convbias, x, w, b; kw...)
