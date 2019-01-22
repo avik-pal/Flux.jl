@@ -197,7 +197,7 @@ end
 import Flux.Tracker
 import Flux.Tracker: stracked, track, unbroadcast, @grad, nobacksies
 using NNlib: padtuple, cdims, dilation_dims, conv, ∇conv_data, ∇conv_filter
-using CuArrays.CUDNN: conv_workspace, cudnnConvolutionBackwardBias, cudnnConvolutionBackwardData,
+using .CuArrays.CUDNN: conv_workspace, cudnnConvolutionBackwardBias, cudnnConvolutionBackwardData,
   cudnnConvolutionBackwardFilter, cudnnActivationBackward, cudnnAddTensor,
   cudnnGetConvolutionForwardWorkspaceSize, cudnnConvolutionBiasActivationForward
 
