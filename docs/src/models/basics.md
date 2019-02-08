@@ -4,45 +4,55 @@
 
 Flux's core feature is taking gradients of Julia code. The `gradient` function takes another Julia function `f` and a set of arguments, and returns the gradient with respect to each argument. (It's a good idea to try pasting these examples in the Julia terminal.)
 
-```julia
-using Flux.Tracker
+```jldoctest basic_1
+julia> using Flux, Random
 
-f(x) = 3x^2 + 2x + 1
+julia> Random.seed!(144);
 
-# df/dx = 6x + 2
-df(x) = Tracker.gradient(f, x; nest = true)[1]
+julia> using Flux.Tracker
 
-df(2) # 14.0 (tracked)
+julia> f(x) = 3x^2 + 2x + 1;
 
-# d²f/dx² = 6
-d2f(x) = Tracker.gradient(df, x; nest = true)[1]
+julia> df(x) = Tracker.gradient(f, x; nest = true)[1]; # df/dx = 6x + 2
 
-d2f(2) # 6.0 (tracked)
+julia> df(2)
+14.0 (tracked)
+
+julia> d2f(x) = Tracker.gradient(df, x; nest = true)[1]; # d²f/dx² = 6
+
+julia> d2f(2)
+6.0 (tracked)
 ```
 
 (We'll learn more about why these numbers show up as `(tracked)` below.)
 
 When a function has many parameters, we can pass them all in explicitly:
 
-```julia
-f(W, b, x) = W * x + b
+```jldoctest basic_1
+julia> f(W, b, x) = W * x + b;
 
-Tracker.gradient(f, 2, 3, 4)
-# (4.0 (tracked), 1.0 (tracked), 2.0 (tracked))
+julia> Tracker.gradient(f, 2, 3, 4)
+(4.0 (tracked), 1.0 (tracked), 2.0 (tracked))
 ```
 
 But machine learning models can have *hundreds* of parameters! Flux offers a nice way to handle this. We can tell Flux to treat something as a parameter via `param`. Then we can collect these together and tell `gradient` to collect the gradients of all `params` at once.
 
-```julia
-W = param(2) # 2.0 (tracked)
-b = param(3) # 3.0 (tracked)
+```jldoctest basic_1
+julia> W = param(2)
+2.0 (tracked)
 
-f(x) = W * x + b
+julia> b = param(3)
+3.0 (tracked)
 
-grads = Tracker.gradient(() -> f(4), params(W, b))
+julia> f(x) = W * x + b;
 
-grads[W] # 4.0
-grads[b] # 1.0
+julia> grads = Tracker.gradient(() -> f(4), params(W, b));
+
+julia> grads[W]
+4.0
+
+julia> grads[b]
+1.0
 ```
 
 There are a few things to notice here. Firstly, `W` and `b` now show up as *tracked*. Tracked things behave like normal numbers or arrays, but keep records of everything you do with them, allowing Flux to calculate their gradients. `gradient` takes a zero-argument function; no arguments are necessary because the `params` tell it what to differentiate.
@@ -53,43 +63,64 @@ This will come in really handy when dealing with big, complicated models. For no
 
 Consider a simple linear regression, which tries to predict an output array `y` from an input `x`.
 
-```julia
-W = rand(2, 5)
-b = rand(2)
+```jldoctest basic_1
+julia> W = rand(2, 5)
+2×5 Array{Float64,2}:
+ 0.302638  0.656917  0.499127  0.455055  0.149527
+ 0.895509  0.685109  0.647218  0.699819  0.115445
 
-predict(x) = W*x .+ b
+julia> b = rand(2)
+2-element Array{Float64,1}:
+ 0.798963832660103
+ 0.982494870514163
 
-function loss(x, y)
-  ŷ = predict(x)
-  sum((y .- ŷ).^2)
-end
+julia> predict(x) = W*x .+ b;
 
-x, y = rand(5), rand(2) # Dummy data
-loss(x, y) # ~ 3
+julia> function loss(x, y)
+           ŷ = predict(x)
+           sum((y .- ŷ).^2)
+       end;
+
+julia> x, y = rand(5), rand(2) # Dummy data
+([0.0129131, 0.952408, 0.797142, 0.074582, 0.309151], [0.691479, 0.907003])
+
+julia> loss(x, y)
+3.281070613644335
 ```
 
 To improve the prediction we can take the gradients of `W` and `b` with respect to the loss and perform gradient descent. Let's tell Flux that `W` and `b` are parameters, just like we did above.
 
-```julia
-using Flux.Tracker
+```jldoctest basic_1
+julia> W = param(W)
+Tracked 2×5 Array{Float64,2}:
+ 0.302638  0.656917  0.499127  0.455055  0.149527
+ 0.895509  0.685109  0.647218  0.699819  0.115445
 
-W = param(W)
-b = param(b)
+julia> b = param(b)
+Tracked 2-element Array{Float64,1}:
+ 0.798963832660103
+ 0.982494870514163
 
-gs = Tracker.gradient(() -> loss(x, y), params(W, b))
+julia> gs = Tracker.gradient(() -> loss(x, y), params(W, b));
 ```
 
 Now that we have gradients, we can pull them out and update `W` to train the model. The `update!(W, Δ)` function applies `W = W + Δ`, which we can use for gradient descent.
 
-```julia
-using Flux.Tracker: update!
+```jldoctest basic_1
+julia> using Flux.Tracker: update!
 
-Δ = gs[W]
+julia> Δ = gs[W]
+Tracked 2×5 Array{Float64,2}:
+ 0.031381   2.31451  1.93719  0.181247  0.751289
+ 0.0346941  2.55887  2.14171  0.200382  0.830606
 
-# Update the parameter and reset the gradient
-update!(W, -0.1Δ)
+julia> update!(W, -0.1Δ) # Update the parameter and reset the gradient
+Tracked 2×5 Array{Float64,2}:
+ 0.2995   0.425465  0.305408  0.43693   0.0743982
+ 0.89204  0.429223  0.433047  0.679781  0.0323844
 
-loss(x, y) # ~ 2.5
+julia> loss(x, y)
+1.4783125803545407 (tracked)
 ```
 
 The loss has decreased a little, meaning that our prediction `x` is closer to the target `y`. If we have some data we can already try [training the model](../training/training.md).
@@ -100,56 +131,88 @@ All deep learning in Flux, however complex, is a simple generalisation of this e
 
 It's common to create more complex models than the linear regression above. For example, we might want to have two linear layers with a nonlinearity like [sigmoid](https://en.wikipedia.org/wiki/Sigmoid_function) (`σ`) in between them. In the above style we could write this as:
 
-```julia
-using Flux
+```jldoctest basic_2
+julia> using Flux, Random
 
-W1 = param(rand(3, 5))
-b1 = param(rand(3))
-layer1(x) = W1 * x .+ b1
+julia> Random.seed!(144);
 
-W2 = param(rand(2, 3))
-b2 = param(rand(2))
-layer2(x) = W2 * x .+ b2
+julia> W1 = param(rand(3, 5))
+Tracked 3×5 Array{Float64,2}:
+ 0.302638  0.685109  0.455055  0.115445  0.0129131
+ 0.895509  0.499127  0.699819  0.798964  0.952408
+ 0.656917  0.647218  0.149527  0.982495  0.797142
 
-model(x) = layer2(σ.(layer1(x)))
+julia> b1 = param(rand(3))
+Tracked 3-element Array{Float64,1}:
+ 0.07458198390809367
+ 0.3091505115830724
+ 0.6914789674633908
 
-model(rand(5)) # => 2-element vector
+julia> layer1(x) = W1 * x .+ b1;
+
+julia> W2 = param(rand(2, 3))
+Tracked 2×3 Array{Float64,2}:
+ 0.907003  0.554385   0.22196
+ 0.477246  0.0287373  0.778577
+
+julia> b2 = param(rand(2))
+Tracked 2-element Array{Float64,1}:
+ 0.6640020768431498
+ 0.8435809491054875
+
+julia> layer2(x) = W2 * x .+ b2;
+
+julia> model(x) = layer2(σ.(layer1(x)));
+
+julia> model(rand(5))
+Tracked 2-element Array{Float64,1}:
+ 2.0850338570971587
+ 1.9763242128630807
 ```
 
 This works but is fairly unwieldy, with a lot of repetition – especially as we add more layers. One way to factor this out is to create a function that returns linear layers.
 
-```julia
-function linear(in, out)
-  W = param(randn(out, in))
-  b = param(randn(out))
-  x -> W * x .+ b
-end
+```jldoctest basic_2
+julia> function linear(in, out)
+           W = param(randn(out, in))
+           b = param(randn(out))
+           x -> W * x .+ b
+       end;
 
-linear1 = linear(5, 3) # we can access linear1.W etc
-linear2 = linear(3, 2)
+julia> linear1 = linear(5, 3); # we can access linear1.W etc
 
-model(x) = linear2(σ.(linear1(x)))
+julia> linear2 = linear(3, 2);
 
-model(rand(5)) # => 2-element vector
+julia> model(x) = linear2(σ.(linear1(x)));
+
+julia> model(rand(5))
+Tracked 2-element Array{Float64,1}:
+  0.6941922496437642
+ -0.5305507787736612
 ```
 
 Another (equivalent) way is to create a struct that explicitly represents the affine layer.
 
-```julia
-struct Affine
-  W
-  b
-end
+```jldoctest basic_2
+julia> struct Affine
+           W
+           b
+       end
 
-Affine(in::Integer, out::Integer) =
-  Affine(param(randn(out, in)), param(randn(out)))
+julia> Affine(in::Integer, out::Integer) =
+           Affine(param(randn(out, in)), param(randn(out)));
 
-# Overload call, so the object can be used as a function
-(m::Affine)(x) = m.W * x .+ m.b
+julia> (m::Affine)(x) = m.W * x .+ m.b; # Overload call, so the object can be used as a function
 
-a = Affine(10, 5)
+julia> a = Affine(10, 5);
 
-a(rand(10)) # => 5-element vector
+julia> a(rand(10))
+Tracked 5-element Array{Float64,1}:
+ -0.007339679564343338
+ -0.31530661673857485
+ -0.8615700550393526
+ -3.5883537411081186
+ -2.7960660197867275
 ```
 
 Congratulations! You just built the `Dense` layer that comes with Flux. Flux has many interesting layers available, but they're all things you could have built yourself very easily.
@@ -161,58 +224,65 @@ Congratulations! You just built the `Dense` layer that comes with Flux. Flux has
 It's pretty common to write models that look something like:
 
 ```julia
-layer1 = Dense(10, 5, σ)
-# ...
-model(x) = layer3(layer2(layer1(x)))
+julia> layer1 = Dense(10, 5, σ)
+
+julia> model(x) = layer3(layer2(layer1(x)))
 ```
 
 For long chains, it might be a bit more intuitive to have a list of layers, like this:
 
-```julia
-using Flux
+```jldoctest basic_2
+julia> layers = [Dense(10, 5, σ), Dense(5, 2), softmax];
 
-layers = [Dense(10, 5, σ), Dense(5, 2), softmax]
+julia> model(x) = foldl((x, m) -> m(x), layers, init = x);
 
-model(x) = foldl((x, m) -> m(x), layers, init = x)
-
-model(rand(10)) # => 2-element vector
+julia> model(rand(10))
+Tracked 2-element Array{Float32,1}:
+ 0.6045897f0
+ 0.3954103f0
 ```
 
 Handily, this is also provided for in Flux:
 
-```julia
-model2 = Chain(
-  Dense(10, 5, σ),
-  Dense(5, 2),
-  softmax)
+```jldoctest basic_2
+julia> model2 = Chain(Dense(10, 5, σ),
+                      Dense(5, 2),
+                      softmax);
 
-model2(rand(10)) # => 2-element vector
+julia> model2(rand(10))
+Tracked 2-element Array{Float32,1}:
+ 0.7414307f0
+ 0.25856924f0
 ```
 
 This quickly starts to look like a high-level deep learning library; yet you can see how it falls out of simple abstractions, and we lose none of the power of Julia code.
 
 A nice property of this approach is that because "models" are just functions (possibly with trainable parameters), you can also see this as simple function composition.
 
-```julia
-m = Dense(5, 2) ∘ Dense(10, 5, σ)
+```jldoctest basic_2
+julia> m = Dense(5, 2) ∘ Dense(10, 5, σ);
 
-m(rand(10))
+julia> m(rand(10))
+Tracked 2-element Array{Float32,1}:
+  0.0030798614f0
+ -0.51426715f0
 ```
 
 Likewise, `Chain` will happily work with any Julia function.
 
-```julia
-m = Chain(x -> x^2, x -> x+1)
+```jldoctest basic_2
+julia> m = Chain(x -> x^2, x -> x+1);
 
-m(5) # => 26
+julia> m(5)
+26
 ```
 
 ## Layer helpers
 
 Flux provides a set of helpers for custom layers, which you can enable by calling
 
-```julia
-Flux.@treelike Affine
+```jldoctest basic_2
+julia> Flux.@treelike Affine
 ```
 
 This enables a useful extra set of functionality for our `Affine` layer, such as [collecting its parameters](../training/optimisers.md) or [moving it to the GPU](../gpu.md).
