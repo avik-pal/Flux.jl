@@ -8,6 +8,7 @@ on a given input.
 `m[1:3](x)` will calculate the output of the first three layers.
 
 # Examples
+
 ```jldoctest
 julia> m = Chain(x -> x^2, x -> x+1);
 
@@ -89,7 +90,7 @@ The weight matrix and/or the bias vector (of length `out`) may also be provided 
 # Examples
 ```jldoctest
 julia> d = Dense(5, 2)
-Dense(5, 2)
+Dense(5, 2)         # 12 parameters
 
 julia> d(rand(Float32, 5, 64)) |> size
 (2, 64)
@@ -98,7 +99,7 @@ julia> d(rand(Float32, 5, 1, 1, 64)) |> size  # treated as three batch dimension
 (2, 1, 1, 64)
 
 julia> d1 = Dense(ones(2, 5), false, tanh)  # using provided weight matrix
-Dense(5, 2, tanh; bias=false)
+Dense(5, 2, tanh; bias=false)  # 10 parameters
 
 julia> d1(ones(5))
 2-element Vector{Float64}:
@@ -180,13 +181,13 @@ function Diagonal(sz::Integer...; initα = nothing, initβ = nothing)
     Base.depwarn("keyword initα is deprecated, please simply supply the desired vectors", :Diagonal)
     initα(sz...)
   else
-    ones(sz...)
+    ones32(sz...)
   end
   β = if initβ !== nothing
     Base.depwarn("keyword initβ is deprecated, please simply supply the desired vectors", :Diagonal)
     initβ(sz...)
   else
-    zeros(sz...)
+    zeros32(sz...)
   end
   Diagonal(α, β)
 end
@@ -395,7 +396,11 @@ julia> size(model(rand(3)))
 (17,)
 
 julia> model = Parallel(+, Dense(10, 2), Dense(5, 2))
-Parallel(+, Dense(10, 2), Dense(5, 2))
+Parallel(
+  +,
+  Dense(10, 2),                         # 22 parameters
+  Dense(5, 2),                          # 12 parameters
+)                   # Total: 4 arrays, 34 parameters, 392 bytes.
 
 julia> size(model(rand(10), rand(5)))
 (2,)
@@ -417,8 +422,67 @@ Parallel(connection, layers...) = Parallel(connection, layers)
 Base.getindex(m::Parallel, i::Integer) = m.layers[i]
 Base.getindex(m::Parallel, i::AbstractVector) = Parallel(m.connection, m.layers[i]...)
 
+trainable(m::Parallel) = (m.connection, m.layers...)
+
 function Base.show(io::IO, m::Parallel)
   print(io, "Parallel(", m.connection, ", ")
   join(io, m.layers, ", ")
   print(io, ")")
+end
+
+"""
+    Embedding(in, out; init=randn)
+
+A lookup table that stores embeddings of dimension `out` 
+for a vocabulary of size `in`. 
+
+This layers is often used to store word embeddings and retrieve them using indices. 
+The input to the layer can be either a vector of indexes
+or the corresponding [onehot encoding](@ref Flux.OneHotArray). 
+
+# Examples
+
+```julia-repl
+julia> using Flux: Embedding
+
+julia> vocab_size, embed_size = 1000, 4;
+
+julia> model = Embedding(vocab_size, embed_size)
+Embedding(1000, 4)
+
+julia> vocab_idxs = [1, 722, 53, 220, 3]
+
+julia> x = OneHotMatrix(vocab_idxs, vocab_size);
+
+julia> model(x)
+4×5 Matrix{Float32}:
+  0.91139    0.670462    0.463217   0.670462    0.110932
+  0.247225  -0.0823874   0.698694  -0.0823874   0.945958
+ -0.393626  -0.590136   -0.545422  -0.590136    0.77743
+ -0.497621   0.87595    -0.870251   0.87595    -0.772696
+```
+
+julia> model(vocab_idxs) == model(x)
+true
+"""
+struct Embedding{W}
+  weight::W
+end
+
+@functor Embedding
+
+Embedding(in::Integer, out::Integer; init = randn32) = Embedding(init(out, in))
+  
+
+(m::Embedding)(x::Integer) = m.weight[:, x]
+(m::Embedding)(x::AbstractVector) = NNlib.gather(m.weight, x)
+(m::Embedding)(x::AbstractArray) = reshape(m(vec(x)), :, size(x)...)
+
+function (m::Embedding)(x::Union{OneHotVector{T,L}, OneHotMatrix{T,L}}) where {T,L}
+    size(m.weight, 2) == L || throw(DimensionMismatch("Matrix column must correspond with OneHot size: $(size(m.weight, 2)) != $L"))
+  return m(onecold(x))
+end
+ 
+function Base.show(io::IO, m::Embedding)
+  print(io, "Embedding($(size(m.weight, 2)), $(size(m.weight, 1)))")
 end
