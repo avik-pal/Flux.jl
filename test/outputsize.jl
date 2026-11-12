@@ -2,18 +2,18 @@
   m = Chain(Conv((3, 3), 3 => 16), Conv((3, 3), 16 => 32))
   @test outputsize(m, (10, 10, 3, 1)) == (6, 6, 32, 1)
 
-  m = Dense(10, 5)
+  m = Dense(10 => 5)
   @test_throws DimensionMismatch outputsize(m, (5, 2)) == (5, 1)
   @test outputsize(m, (10,); padbatch=true) == (5, 1)
 
-  m = Chain(Dense(10, 8, σ), Dense(8, 5), Dense(5, 2))
+  m = Chain(Dense(10 => 8, σ), Dense(8 => 5), Dense(5 => 2))
   @test outputsize(m, (10,); padbatch=true) == (2, 1)
   @test outputsize(m, (10, 30)) == (2, 30)
 
-  m = Chain(Dense(10, 8, σ), Dense(8, 4), Dense(5, 2))
+  m = Chain(Dense(10 => 8, σ), Dense(8 => 4), Dense(5 => 2))
   @test_throws DimensionMismatch outputsize(m, (10,))
 
-  m = Flux.Diagonal(10)
+  m = Flux.Scale(10)
   @test outputsize(m, (10, 1)) == (10, 1)
 
   m = Maxout(() -> Conv((3, 3), 3 => 16), 2)
@@ -22,10 +22,10 @@
   m = flatten
   @test outputsize(m, (5, 5, 3, 10)) == (75, 10)
 
-  m = Flux.unsqueeze(3)
+  m = Flux.unsqueeze(dims=3)
   @test outputsize(m, (5, 7, 13)) == (5, 7, 1, 13)
 
-  m = Flux.Bilinear(10, 10, 7)
+  m = Flux.Bilinear((10, 10) => 7)
   @test outputsize(m, (10,)) == (7,)
   @test outputsize(m, (10, 32)) == (7, 32)
 
@@ -40,18 +40,76 @@
   @test outputsize(m, (10, 10, 3, 1)) == (10, 10, 19, 1)
 end
 
+@testset "embedding" begin
+  # The input size is that of the array of indices, not of the one-hot array
+  m = Embedding(100 => 8)
+  @test outputsize(m, (12,)) == size(m(rand(1:100, 12))) == (8, 12)
+  @test outputsize(m, (12, 4)) == size(m(rand(1:100, 12, 4))) == (8, 12, 4)
+  @test outputsize(m, (5, 6, 7)) == size(m(rand(1:100, 5, 6, 7))) == (8, 5, 6, 7)
+  @test outputsize(m, (12,); padbatch=true) == (8, 12, 1)
+
+  m = Embedding(100 => 8; padding_idx=1)
+  @test outputsize(m, (12, 4)) == size(m(rand(1:100, 12, 4))) == (8, 12, 4)
+
+  m = Chain(Embedding(100 => 8), Dense(8 => 3), x -> sum(x; dims=2))
+  @test outputsize(m, (12, 4)) == size(m(rand(1:100, 12, 4))) == (3, 1, 4)
+
+  @test_throws DimensionMismatch outputsize(Chain(Embedding(100 => 8), Dense(7 => 3)), (12,))
+end
+
+@testset "embedding bag" begin
+  # Each column of indices is one bag, reduced to one column of the output
+  m = EmbeddingBag(100 => 8)
+  @test outputsize(m, (5,)) == size(m(rand(1:100, 5))) == (8,)
+  @test outputsize(m, (5, 3)) == size(m(rand(1:100, 5, 3))) == (8, 3)
+  @test outputsize(m, (5, 3, 2)) == size(m(rand(1:100, 5, 3, 2))) == (8, 3, 2)
+  @test outputsize(m, (5,); padbatch=true) == (8, 1)
+  @test outputsize(EmbeddingBag(100 => 8, sum), (5, 3)) == (8, 3)
+
+  # A vector of bags, and the `(data, at)` form, go through the same method
+  nils(n) = fill(Flux.nil, n)
+  @test size(m([nils(3), nils(4)])) == size(m([rand(1:100, 3), rand(1:100, 4)])) == (8, 2)
+  @test size(m(nils(7), [1, 4])) == size(m(rand(1:100, 7), [1, 4])) == (8, 2)
+
+  m = Chain(EmbeddingBag(100 => 8), Dense(8 => 3))
+  @test outputsize(m, (5, 3)) == size(m(rand(1:100, 5, 3))) == (3, 3)
+
+  @test_throws DimensionMismatch outputsize(Chain(EmbeddingBag(100 => 8), Dense(7 => 3)), (5,))
+end
+
 @testset "multiple inputs" begin
-  m = Parallel(vcat, Dense(2, 4, relu), Dense(3, 6, relu))
+  m = Parallel(vcat, Dense(2 => 4, relu), Dense(3 => 6, relu))
   @test outputsize(m, (2,), (3,)) == (10,)
   @test outputsize(m, ((2,), (3,))) == (10,)
   @test outputsize(m, (2,), (3,); padbatch=true) == (10, 1)
   @test outputsize(m, (2,7), (3,7)) == (10, 7)
 
-  m = Chain(m, Dense(10, 13, tanh), softmax)
+  m = Chain(m, Dense(10 => 13, tanh), softmax)
   @test outputsize(m, (2,), (3,)) == (13,)
   @test outputsize(m, ((2,), (3,))) == (13,)
   @test outputsize(m, (2,), (3,); padbatch=true) == (13, 1)
   @test outputsize(m, (2,7), (3,7)) == (13, 7)
+end
+
+@testset "tuple-valued outputs" begin
+  # PairwiseFusion returns a tuple of each layer's output
+  m = PairwiseFusion(+, Dense(10 => 5), Dense(5 => 3))
+  @test outputsize(m, (10,), (5,)) == size.(m(randn(Float32, 10), randn(Float32, 5))) == ((5,), (3,))
+  @test outputsize(m, (10, 4), (5, 4)) == ((5, 4), (3, 4))
+  @test outputsize(m, (10,), (5,); padbatch=true) == ((5, 1), (3, 1))
+
+  # Recurrent cells return (output, state); LSTMCell nests the state as (h, c)
+  @test outputsize(RNNCell(3 => 5), (3,)) == ((5,), (5,))
+  @test outputsize(RNNCell(3 => 5), (3, 4)) == ((5, 4), (5, 4))
+  @test outputsize(LSTMCell(3 => 5), (3,)) == ((5,), ((5,), (5,)))
+  @test outputsize(LSTMCell(3 => 5), (3, 4)) == ((5, 4), ((5, 4), (5, 4)))
+  @test outputsize(GRUCell(3 => 5), (3, 4)) == ((5, 4), (5, 4))
+
+  m = LSTM(3 => 5; return_state = true)
+  x = randn(Float32, 3, 7, 2)
+  y = m(x)
+  @test outputsize(m, (3, 7, 2)) == (size(y[1]), size.(y[2])) == ((5, 7, 2), ((5, 2), (5, 2)))
+  @test outputsize(RNN(3 => 5; return_state = true), (3, 7))[1] == (5, 7)
 end
 
 @testset "activations" begin
@@ -59,7 +117,7 @@ end
                      leakyrelu, lisht, logcosh, logσ, mish,
                      relu, relu6, rrelu, selu, σ, softplus,
                      softshrink, softsign, swish, tanhshrink, trelu]
-    @test outputsize(Dense(10, 5, f), (10, 1)) == (5, 1)
+    @test outputsize(Dense(10 => 5, f), (10, 1)) == (5, 1)
   end
 end
 
@@ -141,16 +199,131 @@ end
   m = LayerNorm(32)
   @test outputsize(m, (32, 32, 3, 16)) == (32, 32, 3, 16)
   @test outputsize(m, (32, 32, 3); padbatch=true) == (32, 32, 3, 1)
+  m2 = LayerNorm(3, 2)
+  @test outputsize(m2, (3, 2)) == (3, 2) == size(m2(randn(3, 2)))
 
   m = BatchNorm(3)
   @test outputsize(m, (32, 32, 3, 16)) == (32, 32, 3, 16)
   @test outputsize(m, (32, 32, 3); padbatch=true) == (32, 32, 3, 1)
+  @test_throws Exception m(randn(Float32, 32, 32, 5, 1))
+  @test_throws DimensionMismatch outputsize(m, (32, 32, 5, 1))
 
   m = InstanceNorm(3)
   @test outputsize(m, (32, 32, 3, 16)) == (32, 32, 3, 16)
   @test outputsize(m, (32, 32, 3); padbatch=true) == (32, 32, 3, 1)
+  @test_throws Exception m(randn(Float32, 32, 32, 5, 1))
+  @test_throws DimensionMismatch outputsize(m, (32, 32, 5, 1))
 
   m = GroupNorm(16, 4)
   @test outputsize(m, (32, 32, 16, 16)) == (32, 32, 16, 16)
   @test outputsize(m, (32, 32, 16); padbatch=true) == (32, 32, 16, 1)
+  @test_throws Exception m(randn(Float32, 32, 32, 15, 4))
+  @test_throws DimensionMismatch outputsize(m, (32, 32, 15, 4))
+end
+
+@testset "autosize macro" begin
+  m = @autosize (3,) Dense(_ => 4)
+  @test randn(3) |> m |> size == (4,)
+
+  m = @autosize (3, 1) Chain(Dense(_, 4), Dense(4 => 10), softmax)
+  @test randn(3, 5) |> m |> size == (10, 5)
+  
+  m = @autosize (2, 3, 4, 5) Dense(_ => 10)  # goes by first dim, not 2nd-last
+  @test randn(2, 3, 4, 5) |> m |> size == (10, 3, 4, 5)
+
+  # Embedding's input is indices, so its vocabulary size can't be inferred:
+  @test_throws ArgumentError("@autosize cannot infer the `_` in `Embedding(_ => out)`, as this is the vocabulary size, not a size of the input") @autosize (2, 3) Embedding(_ => 10)
+  # but layers after it can be:
+  m = @autosize (12, 4) Chain(Embedding(100 => 8), Dense(_ => 2))
+  @test m[2].weight |> size == (2, 8)
+  @test rand(1:100, 12, 4) |> m |> size == (2, 12, 4)
+  # and the same for EmbeddingBag:
+  @test_throws ArgumentError("@autosize cannot infer the `_` in `EmbeddingBag(_ => out)`, as this is the vocabulary size, not a size of the input") @autosize (5, 3) EmbeddingBag(_ => 10)
+  m = @autosize (5, 3) Chain(EmbeddingBag(100 => 8), Dense(_ => 2))
+  @test m[2].weight |> size == (2, 8)
+  @test rand(1:100, 5, 3) |> m |> size == (2, 3)
+
+  m = @autosize (9,) Dense(_ => div(_,2))
+  @test randn(9) |> m |> size == (4,)
+
+  m = @autosize (3,) Chain(one = Dense(_ => 4), two = softmax)  # needs kw
+  @test randn(3) |> m |> size == (4,)
+  
+  m = @autosize (3,) Chain(; one = Dense(_ => 4), two = softmax)  # needs parameters
+  @test randn(3) |> m |> size == (4,)
+
+  m = @autosize (3, 45) Maxout(() -> Dense(_ => 6, tanh), 2)    # needs ->, block
+  @test randn(3, 45) |> m |> size == (6, 45)
+
+  # here Parallel gets two inputs, no problem:
+  m = @autosize (3,) Chain(SkipConnection(Dense(_ => 4), Parallel(vcat, Dense(_ => 5), Dense(_ => 6))), Flux.Scale(_))
+  @test randn(3) |> m |> size == (11,)
+  
+  # like Dense, LayerNorm goes by the first dimension:
+  m = @autosize (3, 4, 5) LayerNorm(_)
+  @test rand(3, 6, 7) |> m |> size == (3, 6, 7)
+
+  m = @autosize (3, 3, 10) LayerNorm(_, _)  # does not check that sizes match
+  @test rand(3, 3, 10) |> m |> size == (3, 3, 10)
+  
+  m = @autosize (3,) Flux.Bilinear(_ => 10)
+  @test randn(3) |> m |> size == (10,)
+
+  m = @autosize (3, 1) Flux.Bilinear(_ => 10)
+  @test randn(3, 4) |> m |> size == (10, 4)
+  
+  m = @autosize (3,) SkipConnection(Dense(_ => _), Flux.Bilinear(_ => 10))  # Bilinear gets two inputs
+  @test randn(3, 4) |> m |> size == (10, 4)
+  
+  @test_throws Exception @eval @autosize (3,) Flux.Bilinear((_,3) => 10)
+  
+  # first docstring example
+  m = @autosize (3, 1) Chain(Dense(_ => 2, sigmoid), BatchNorm(_, affine=false))
+  @test randn(3, 4) |> m |> size == (2, 4)
+  
+  # evil docstring example
+  img = [28, 28];
+  m = @autosize (img..., 1, 32) Chain(              # size is only needed at runtime
+         Chain(c = Conv((3,3), _ => 5; stride=2, pad=SamePad()),
+               p = MeanPool((3,3)),
+               b = BatchNorm(_),
+               f = Flux.flatten),
+         Dense(_ => _÷4, relu, init=Flux.rand32),   # can calculate output size _÷4
+         SkipConnection(Dense(_ => _, relu), +),
+         Dense(_ => 10),
+      )
+  @test randn(Float32, img..., 1, 32) |> m |> size == (10, 32)
+  
+  # https://github.com/FluxML/Flux.jl/issues/2086
+  m = @autosize (3, 1) Chain(; c = Dense(_ => 2, sigmoid), b = BatchNorm(_, affine=false))
+  @test randn(Float32, 3, 32) |> m |> size == (2, 32)
+end
+
+@testset "LazyLayer" begin
+  # This is what `@autosize` uses, ideally nobody should make these by hand!
+  # Implicitly testeed by the macro, explicitly here too: 
+  ld = Flux.LazyLayer("Dense(_ => 3, relu; init=??)", x -> Dense(Flux.autosizefor(Dense, x) => 3, relu, init=ones), nothing)
+
+  lm = Chain(ld, Flux.Scale(3))
+  @test string(ld) == "LazyLayer(Dense(_ => 3, relu; init=??))"
+  @test_throws Exception Flux.striplazy(lm)
+
+  @test lm([1,2]) == [3,3,3]
+
+  @test string(ld) == "LazyLayer(Dense(2 => 3, relu))"
+  @test Flux.striplazy(ld) isa Dense
+
+  @test_throws Exception Flux.trainables(lm)
+  @test_throws Exception gradient(x -> sum(abs2, lm(x)), [1,2])
+  @test_throws Exception gradient(m -> sum(abs2, Flux.striplazy(m)([1,2])), ld)
+  
+  # Can't let |> gpu act before the arrays are materialized... so it's an error: 
+  @test_throws ErrorException @eval @autosize (1,2,3) Dense(_=>2) |> f64
+end
+
+@testset "type matching" begin
+  # Check that _match_eltype doesn't replace this with an array of Float32:
+  @test Flux._match_eltype(Dense(2=>3), fill(Flux.Nil(),2,4)) isa Matrix{Flux.Nil}
+  # For RNN etc there's a special path:
+  @test RNN(2=>3)(fill(Flux.Nil(),2,4)) isa Matrix{Flux.Nil}
 end

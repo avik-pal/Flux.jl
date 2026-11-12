@@ -1,0 +1,176 @@
+# ENZYME CPU TESTS
+
+@testset "enzyme gradients" begin
+    BROKEN_TESTS = []
+    # test_gradients already compares these against Enzyme in their own layer tests
+    CHECKED_ELSEWHERE = ("Attention", "RNN", "LSTM", "GRU")
+    for (model, x, name) in TEST_MODELS
+        name in CHECKED_ELSEWHERE && continue
+        @testset "Enzyme grad check $name" begin
+            @test test_gradients(model, x; reference=AutoZygote(), compare=AutoEnzyme()) broken=(name ∈ BROKEN_TESTS)
+        end
+    end
+end
+
+@testset "loss gradients" begin
+    @testset "Enzyme grad check $loss" for loss in ALL_LOSSES
+        ŷ = 0.1f0 .+ 0.8f0 .* rand(Float32, 3, 4)
+        y = 0.1f0 .+ 0.8f0 .* rand(Float32, 3, 4)
+
+        gz = only(Flux.gradient(ŷ -> loss(ŷ, y), AutoZygote(), ŷ))
+        ge = first(Flux.gradient(loss, AutoEnzyme(), ŷ, Const(y)))
+        @test ge ≈ gz rtol=1e-4 atol=1e-4
+    end
+end
+
+@testset "loss gradients, Float16 and BFloat16" begin
+    # Before Julia 1.11, `BFloat16` isn't `Core.BFloat16`, and Enzyme can't differentiate its arithmetic.
+    lowprecs = isdefined(Core, :BFloat16) ? ((Float16, f16), (BFloat16, bf16)) : ((Float16, f16),)
+    @testset "Enzyme grad check $loss, $T" for loss in ALL_LOSSES, (T, lowprec) in lowprecs
+        ŷ = lowprec(0.1f0 .+ 0.8f0 .* rand(Float32, 3, 4))
+        y = lowprec(0.1f0 .+ 0.8f0 .* rand(Float32, 3, 4))
+
+        gz = only(Flux.gradient(ŷ -> loss(ŷ, y), AutoZygote(), ŷ))
+        ge = first(Flux.gradient(loss, AutoEnzyme(), ŷ, Const(y)))
+        @test eltype(ge) == T
+        @test ge ≈ gz
+    end
+end
+
+@testset "loss gradients, class labels" begin
+    C = 4
+    cases = [(randn(Float32, C, 5), rand(1:C, 5), 1),
+             (randn(Float32, 3, C, 5), rand(1:C, 3, 5), 2),
+             (randn(Float32, C, 5), onehotbatch(rand(1:C, 5), 1:C), 1)]
+    @testset "$loss, $(typeof(y)), dims = $dims" for loss in (logitcrossentropy, crossentropy), (x, y, dims) in cases
+        x = loss === crossentropy ? softmax(x; dims) : x
+        gz = only(Flux.gradient(x -> loss(x, y; dims), AutoZygote(), x))
+        ge = first(Flux.gradient((x, y) -> loss(x, y; dims), AutoEnzyme(), x, Const(y)))
+        @test ge ≈ gz rtol=1e-4 atol=1e-4
+    end
+end
+
+@testset "gradient, withgradient, Duplicated" begin
+    # Tests above are about how Enzyme digests Flux layers.
+    # Tests here are just the interface Flux.gradient(f, Duplicated(model)) etc.
+    m1 = Duplicated(Dense(3=>2))
+    @test m1 isa Enzyme.Duplicated
+    g1 = Flux.gradient(m -> sum(m.bias), m1) |> only
+    @test iszero(g1.weight)
+    @test g1.bias == [1, 1]
+    @test m1.dval.bias == [1, 1]
+
+    g2 = Flux.withgradient((m,x) -> sum(m(x)), m1, Const([1,2,3f0]))
+    @test g2.val ≈ sum(m1([1,2,3f0]))
+    @test g2.grad[1].weight ≈ [1 2 3; 1 2 3]
+    @test g2.grad[2] === nothing
+
+    ## Auxiliary outputs: `f` returns a Tuple/NamedTuple whose first element is the scalar loss.
+    # Tuple aux with a numeric array (whole-tuple stashing would zero the gradient here):
+    g3 = Flux.withgradient(Duplicated([1,2,4.], zeros(3))) do x
+              z = 1 ./ x
+              sum(z), z  # here z is an auxiliary output
+           end
+    @test g3.grad[1] ≈ [-1.0, -0.25, -0.0625]
+    @test g3.val[1] ≈ 1.75
+    @test g3.val[2] ≈ [1.0, 0.5, 0.25]
+    # NamedTuple aux, including a non-numeric (String) element:
+    g4 = Flux.withgradient(Duplicated([1,2,4.], zeros(3))) do x
+              z = 1 ./ x
+              (loss=sum(z), aux=string(z))
+           end
+    @test g4.grad[1] ≈ [-1.0, -0.25, -0.0625]
+    @test g4.val.loss ≈ 1.75
+    @test g4.val.aux == "[1.0, 0.5, 0.25]"
+    # NamedTuple aux with a numeric array (whole-value stashing would zero the gradient here):
+    m2 = Dense([1 2 3; 4 5 6f0] ./ 10, [0, 1f0], tanh)
+    x2 = Float32[1 -1 0.5 2; 0 1 2 3; -1 0 1 2]
+    fnt = (m, x) -> (loss=sum(m(x)), pred=m(x))
+    gnt = Flux.withgradient(fnt, Duplicated(deepcopy(m2)), x2)
+    gzy = Flux.withgradient(fnt, m2, x2)
+    @test gnt.val.loss ≈ gzy.val.loss
+    @test gnt.val.pred ≈ gzy.val.pred
+    @test gnt.grad[1].weight ≈ gzy.grad[1].weight
+    @test gnt.grad[2] ≈ gzy.grad[2]
+    # Aux value matches Zygote's, and the scalar-loss branch is unaffected:
+    for f in (x -> (sum(abs2, x), 1 ./ x),
+              x -> (loss=sum(abs2, x), acc=sum(x)),
+              x -> sum(abs2, x))
+        z = Duplicated([1,2,4.], zeros(3))
+        ge = Flux.withgradient(f, z)
+        gz = Flux.withgradient(f, [1,2,4.])
+        @test ge.val == gz.val
+        @test ge.grad[1] ≈ gz.grad[1]
+    end
+    # Multiple differentiated args with aux, plus a Const arg:
+    g5 = Flux.withgradient(Duplicated([1,2.], zeros(2)), Const([3,4.])) do a, b
+              sum(a .* b), a .+ b
+           end
+    @test g5.grad[1] ≈ [3, 4]
+    @test g5.grad[2] === nothing
+    @test g5.val[2] ≈ [4, 6]
+
+    # setup understands Duplicated:
+    @test Flux.setup(Adam(), m1) == Flux.setup(Adam(), m1.val)
+
+    # state, loadmodel do too -- all ignore the dval branch, no outer (; val, dval) namedtuple
+    @test Flux.state(m1) == Flux.state(m1.val)
+    oldmodel = deepcopy(m1)
+    oldpar = deepcopy(Flux.state(m1))
+    m1.val.weight .= 0
+    @test Flux.loadmodel!(m1, oldmodel).val.weight ≈ oldpar.weight
+    m1.val.weight .= 0
+    @test Flux.loadmodel!(m1, oldpar).val.weight ≈ oldpar.weight
+
+    # Only Const args are supported
+    @test Flux.gradient(m -> sum(m.bias), Const(m1.val))[1] === nothing
+    @test Flux.gradient((m,x) -> sum(m(x)), Const(m1.val), [1,2,3f0]) isa Tuple{Nothing,Vector{Float32}}
+    @test Flux.withgradient(m -> sum(m.bias), Const(m1.val)).grad[1] === nothing
+    @test Flux.withgradient((m,x) -> sum(m(x)), Const(m1.val), [1,2,3f0]).grad isa Tuple{Nothing,Vector{Float32}}
+    # Active is disallowed:
+    @test_throws ArgumentError Flux.gradient((m,z) -> sum(m.bias)/z, m1, Active(3f0))
+    @test_throws ArgumentError Flux.gradient((m,z) -> sum(m.bias)/z, m1.val, Active(3f0))
+    @test_throws ArgumentError Flux.gradient((m,z) -> sum(m.bias)/z, Const(m1.val), Active(3f0))
+    # Duplicated
+    @test_throws Exception Flux.gradient((m,z) -> sum(m.bias)/z, m1, Duplicated(3f0, 0f0))
+
+    # Using Duplicated within Zygote.gradient is not supported:
+    @test_throws ErrorException Zygote.gradient((m,x) -> sum(m(x)), m1, [1,2,3f0])
+end
+
+@testset "gradient through f64" begin
+    W = randn(Float32, 4, 4)
+    m = Chain(Dense(W, true, tanh), LayerNorm(4), Dense(W))  # tied weight
+    x = randn(Float32, 4, 3)
+    loss(m) = sum(abs2, m(x))
+    g = Flux.gradient(loss, Duplicated(m))[1]
+    g64 = Flux.gradient(m -> loss(f64(m)), Duplicated(m))[1]
+    @test eltype(g64.layers[1].weight) == Float32
+    @test g64.layers[1].weight ≈ g.layers[1].weight
+    @test g64.layers[2].diag.scale ≈ g.layers[2].diag.scale
+end
+
+@testset "bugs found" begin
+    _duplicated(x) = Duplicated(x, Enzyme.make_zero(x))
+    z = _duplicated(zeros32(3))
+    @test Flux.gradient(sum ∘ LayerNorm(3), z)[1] ≈ [0.0, 0.0, 0.0]
+    @test Flux.gradient(|>, z, _duplicated(sum ∘ LayerNorm(3)))[1] ≈ [0.0, 0.0, 0.0]
+    @test Flux.gradient(|>, z, Const(sum ∘ LayerNorm(3)))[2] === nothing
+    @test Flux.withgradient(sum ∘ LayerNorm(3), z).grad[1] ≈ [0.0, 0.0, 0.0]
+    @test Flux.withgradient(|>, z, _duplicated(sum ∘ LayerNorm(3))).grad[1] ≈ [0.0, 0.0, 0.0]
+
+    # type instability of the recurrent layers broke the split mode (EnzymeAD/Enzyme.jl#2897)
+    rnnloss(m, x) = sum(m(x))
+    x = randn(Float32, 3, 4, 2)
+    @testset "split mode $(nameof(typeof(rnn)))" for rnn in [RNN(3 => 2), LSTM(3 => 2), GRU(3 => 2), GRUv3(3 => 2)]
+        drnn = _duplicated(rnn)
+        forward, reverse = Enzyme.autodiff_thunk(ReverseSplitWithPrimal, Const{typeof(rnnloss)}, Active,
+                                                 typeof(drnn), Const{typeof(x)})
+        tape, primal, _ = forward(Const(rnnloss), drnn, Const(x))
+        reverse(Const(rnnloss), drnn, Const(x), 1f0, tape)
+        gz = Flux.gradient(m -> rnnloss(m, x), AutoZygote(), rnn)[1]
+        @test primal ≈ rnnloss(rnn, x)
+        @test drnn.dval.cell.Wi ≈ gz.cell.Wi
+        @test drnn.dval.cell.Wh ≈ gz.cell.Wh
+    end
+end

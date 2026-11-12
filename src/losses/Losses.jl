@@ -3,9 +3,12 @@ module Losses
 using Statistics
 using Zygote
 using Zygote: @adjoint
-using ..Flux: ofeltype, epseltype
-using CUDA
-using NNlib: logsoftmax, logσ
+using ChainRulesCore
+using ..Flux: BFloat16, _to_bf16
+ofeltype(x, y) = convert(float(eltype(x)), y)
+epseltype(x) = eps(_upcasttype(float(eltype(x))))
+using NNlib: NNlib, logsoftmax, logsumexp, logσ, ctc_loss, ctc_alpha, ∇ctc_loss
+using OneHotArrays: OneHotArray, _indices
 import Base.Broadcast: broadcasted
 
 export mse, mae, msle,
@@ -18,12 +21,9 @@ export mse, mae, msle,
     dice_coeff_loss,
     poisson_loss,
     hinge_loss, squared_hinge_loss,
-    ctc_loss,
-    binary_focal_loss, focal_loss
+    binary_focal_loss, focal_loss, siamese_contrastive_loss
 
 include("utils.jl")
 include("functions.jl")
-include("ctc.jl")
-if CUDA.functional() include("ctc-gpu.jl") end
 
 end #module

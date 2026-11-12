@@ -1,37 +1,89 @@
-using Documenter, Flux, NNlib
+using Documenter
+using Flux, NNlib, Functors, MLUtils, BSON, Optimisers, 
+      OneHotArrays, Zygote, ChainRulesCore, Plots, MLDatasets, Statistics, 
+      DataFrames, JLD2, MLDataDevices, MLCore, Mooncake
+using MLCore: numobs, getobs, getobs!
 
-DocMeta.setdocmeta!(Flux, :DocTestSetup, :(using Flux); recursive=true)
-makedocs(modules=[Flux, NNlib],
-         doctest = VERSION == v"1.5",
-         sitename = "Flux",
-         pages = ["Home" => "index.md",
-                  "Building Models" =>
-                    ["Basics" => "models/basics.md",
-                     "Recurrence" => "models/recurrence.md",
-                     "Model Reference" => "models/layers.md",
-                     "Loss Functions" => "models/losses.md",
-                     "Regularisation" => "models/regularisation.md",
-                     "Advanced Model Building" => "models/advanced.md",
-                     "NNlib" => "models/nnlib.md"],
-                  "Handling Data" =>
-                    ["One-Hot Encoding" => "data/onehot.md",
-                     "DataLoader" => "data/dataloader.md"],
-                  "Training Models" =>
-                    ["Optimisers" => "training/optimisers.md",
-                     "Training" => "training/training.md"],
-                  "GPU Support" => "gpu.md",
-                  "Saving & Loading" => "saving.md",
-                  "The Julia Ecosystem" => "ecosystem.md",
-                  "Utility Functions" => "utilities.md",
-                  "Performance Tips" => "performance.md",
-                  "Datasets" => "datasets.md",
-                  "Community" => "community.md"],
-         format = Documenter.HTML(
-             analytics = "UA-36890222-9",
-             assets = ["assets/flux.css"],
-             prettyurls = get(ENV, "CI", nothing) == "true"),
-         )
+ENV["DATADEPS_ALWAYS_ACCEPT"] = true
 
-deploydocs(repo = "github.com/FluxML/Flux.jl.git",
-           target = "build",
-           push_preview = true)
+DocMeta.setdocmeta!(Flux, :DocTestSetup, :(using Flux); recursive = true)
+
+makedocs(
+    ## This should be
+    ## modules = [Flux], checkdocs = :all,
+    ## but we get errors.
+    modules = [Flux, NNlib, Functors, MLUtils, MLCore, Zygote, OneHotArrays, Optimisers, ChainRulesCore, MLDataDevices],
+    sitename = "Flux",
+    doctest = false,   # done later
+    checkdocs = :none, # :all, :exports, :none
+    # checkdocs_ignored_modules =  [NNlib, Functors, MLUtils, Zygote, OneHotArrays, Optimisers, ChainRulesCore, MLDataDevices],
+    warnonly = [:cross_references],
+    format = Documenter.HTML(
+        sidebar_sitename = false,
+        analytics = "UA-36890222-9",
+        assets = ["assets/flux.css"],
+        prettyurls = get(ENV, "CI", nothing) == "true",
+        size_threshold=1_000_000,
+    ),
+    pages = [
+        "Welcome" => "index.md",
+        "Guide" => [
+        # You could read this end-to-end, or skip to what you need.
+        # Aim is to cover each new concept exactly once (but not list all variants).
+        # Hard to invent further divisions which aren't more confusing than helpful?
+            "Quick Start" => "guide/models/quickstart.md",
+            "Fitting a Line" => "guide/models/overview.md",
+            "Gradients and Layers" => "guide/models/basics.md",
+            "Training" => "guide/training/training.md",
+            "Recurrence" => "guide/models/recurrence.md",
+            "GPU Support" => "guide/gpu.md",
+            "Compiling with Reactant" => "guide/reactant.md",
+            "Saving & Loading" => "guide/saving.md",
+            "Performance Tips" => "guide/performance.md",
+            "Profiling" => "guide/profiling.md",
+        ],
+        "Ecosystem" => "ecosystem.md",
+        "Reference" => [
+        # This essentially collects docstrings, with a bit of introduction.
+            "Built-in Layers" => "reference/models/layers.md",
+            "Activation Functions" => "reference/models/activation.md",
+            "Weight Initialisation" => "reference/utilities.md",
+            "Loss Functions" => "reference/models/losses.md",
+            "Training API" => "reference/training/reference.md",
+            "Optimisation Rules" => "reference/training/optimisers.md",
+            "Shape Inference" => "reference/outputsize.md",
+            "Flat vs. Nested" => "reference/destructure.md",
+            "Callback Helpers" => "reference/training/callbacks.md",
+            "Gradients" => "reference/training/gradients.md",
+            "Transfer Data to GPU -- MLDataDevices.jl" => "reference/data/mldatadevices.md",
+            "Batching Data -- MLUtils.jl" => "reference/data/mlutils.md",
+            "OneHotArrays.jl" => "reference/data/onehot.md",
+            "Low-level Operations -- NNlib.jl" => "reference/models/nnlib.md",
+            "Nested Structures -- Functors.jl" => "reference/models/functors.md",
+         ],
+        "Tutorials" => [
+        # These walk you through various tasks. It's fine if they overlap quite a lot.
+        # All the website tutorials can move here, perhaps much of the model zoo too?
+        # Or perhaps those should just be trashed, model zoo versions are newer & more useful.
+            "Linear Regression" => "tutorials/linear_regression.md",
+            "Logistic Regression" => "tutorials/logistic_regression.md",
+            "Custom Layers" => "tutorials/custom_layers.md",
+            "Model Zoo" => "tutorials/model_zoo.md",
+            #=
+            # "Multi-layer Perceptron" => "tutorials/mlp.md",
+            # "Julia & Flux: 60 Minute Blitz" => "tutorials/blitz.md",
+            "Simple ConvNet" => "tutorials/2021-02-07-convnet.md",
+            "Generative Adversarial Net" => "tutorials/2021-10-14-vanilla-gan.md",
+            "Deep Convolutional GAN" => "tutorials/2021-10-08-dcgan-mnist.md",
+            =#
+        ],
+    ]
+)
+
+doctest(Flux) # only test Flux modules
+
+deploydocs(
+    repo = "github.com/FluxML/Flux.jl.git",
+    target = "build",
+    push_preview = true
+)

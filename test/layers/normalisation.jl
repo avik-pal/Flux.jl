@@ -1,60 +1,124 @@
-using Flux, Test, Statistics
-using Zygote: pullback
-
 evalwgrad(f, x...) = pullback(f, x...)[1]
 
 @testset "Dropout" begin
-  x = [1.,2.,3.]
-  @test x == Dropout(0.1)(x)
-  @test x == evalwgrad(Dropout(0), x)
-  @test zero(x) == evalwgrad(Dropout(1), x)
+  @testset for rng_kwargs in ((), (; rng = MersenneTwister()))
+    x = [1.0+0im,2.0+1im,3.0+3im]
+    @test x == Dropout(0.1; rng_kwargs...)(x)
+    @test x == evalwgrad(Dropout(0; rng_kwargs...), x)
+    @test zero(x) == evalwgrad(Dropout(1; rng_kwargs...), x)
 
-  x = rand(100)
-  m = Dropout(0.9)
-  y = evalwgrad(m, x)
-  @test count(a->a==0, y) > 50
-  testmode!(m, true)
-  y = evalwgrad(m, x) # should override istraining
-  @test count(a->a==0, y) == 0
-  testmode!(m, false)
-  y = evalwgrad(m, x)
-  @test count(a->a==0, y) > 50
+    x = [1.,2.,3.]
+    @test x == Dropout(0.1; rng_kwargs...)(x)
+    @test x == evalwgrad(Dropout(0; rng_kwargs...), x)
+    @test zero(x) == evalwgrad(Dropout(1; rng_kwargs...), x)
 
-  x = rand(Float32, 100)
-  m = Chain(Dense(100,100),
-            Dropout(0.9))
-  y = evalwgrad(m, x)
-  @test count(a->a == 0, y) > 50
-  testmode!(m, true)
-  y = evalwgrad(m, x) # should override istraining
-  @test count(a->a == 0, y) == 0
+    x = rand(100)
+    m = Dropout(0.9; rng_kwargs...)
+    y = evalwgrad(m, x)
+    @test count(a->a==0, y) > 50
+    testmode!(m, true)
+    y = evalwgrad(m, x) # should override istraining
+    @test count(a->a==0, y) == 0
+    testmode!(m, false)
+    y = evalwgrad(m, x)
+    @test count(a->a==0, y) > 50
 
-  x = rand(100, 50)
-  m = Dropout(0.5, dims = 2)
-  y = m(x)
-  c = map(i->count(a->a==0, @view y[i, :]), 1:100)
-  @test minimum(c) == maximum(c)
-  m = Dropout(0.5, dims = 1)
-  y = m(x)
-  c = map(i->count(a->a==0, @view y[:, i]), 1:50)
-  @test minimum(c) == maximum(c)
+    # Keyword active=false
+    m2 = Dropout(0.9; active=false, rng_kwargs...)
+    y2 = evalwgrad(m2, x)
+    @test count(iszero, y2) == 0
 
-  # issue #1084
-  m = Dropout(0.9)
-  x = rand(100)
+    x = rand(Float32, 100)
+    m = Chain(Dense(100 => 100),
+              Dropout(0.9; rng_kwargs...))
+    y = evalwgrad(m, x)
+    @test count(a->a == 0, y) > 50
+    testmode!(m, true)
+    y = evalwgrad(m, x) # should override istraining
+    @test count(a->a == 0, y) == 0
 
-  testmode!(m)
-  y = m(x)
-  @test count(a->a == 0, y) == 0
-  trainmode!(m)
-  y = m(x)
-  @test count(a->a == 0, y) > 50
+    x = rand(100, 50)
+    m = Dropout(0.5; dims = 2, rng_kwargs...)
+    y = m(x)
+    c = map(i->count(a->a==0, @view y[i, :]), 1:100)
+    @test minimum(c) == maximum(c)
+    m = Dropout(0.5; dims = 1, rng_kwargs...)
+    y = m(x)
+    c = map(i->count(a->a==0, @view y[:, i]), 1:50)
+    @test minimum(c) == maximum(c)
 
-  y = Flux.dropout(x, 0.9, active=true)
-  @test count(a->a == 0, y) > 50
+    # issue #1084
+    m = Dropout(0.9; rng_kwargs...)
+    x = rand(100)
 
-  y = Flux.dropout(x, 0.9, active=false)
-  @test count(a->a == 0, y) == 0
+    testmode!(m)
+    y = m(x)
+    @test count(a->a == 0, y) == 0
+    trainmode!(m)
+    y = m(x)
+    @test count(a->a == 0, y) > 50
+
+    y = Flux.dropout(values(rng_kwargs)..., x, 0.9) # , active=true)
+    @test count(a->a == 0, y) > 50
+
+    y = Flux.dropout(values(rng_kwargs)..., x, 0.9 * 0) # , active=false)
+    @test count(a->a == 0, y) == 0
+
+    # CPU RNGs map onto CPU ok
+    if isempty(rng_kwargs)
+      @test cpu(m).rng isa Random.TaskLocalRNG
+    else
+      @test cpu(m).rng === only(values(rng_kwargs))
+    end
+  end
+
+  @test Dropout(0.5; active=true).active === true
+  @test_throws Exception Dropout(0.5; active=:something_else)
+end
+
+@testset "AlphaDropout" begin
+  @testset for rng_kwargs in ((), (; rng = MersenneTwister()))
+    x = [1., 2., 3.]
+    @test x == AlphaDropout(0.1; rng_kwargs...)(x)
+    @test x == evalwgrad(AlphaDropout(0; rng_kwargs...), x)
+    @test zero(x) == evalwgrad(AlphaDropout(1; rng_kwargs...), x)
+
+    x = randn(1000) # large enough to prevent flaky test
+    m = AlphaDropout(0.5; rng_kwargs...)
+
+    y = evalwgrad(m, x)
+    # Should preserve unit mean and variance
+    @test mean(y) ≈ 0 atol=0.2
+    @test var(y) ≈ 1 atol=0.2
+
+    testmode!(m, true) # should override istraining
+    @test evalwgrad(m, x) == x
+
+    testmode!(m, false)
+    y = evalwgrad(m, x)
+    @test mean(y) ≈ 0 atol=0.2
+    @test var(y) ≈ 1 atol=0.2
+
+    # Known good value ranges
+    # Values taken from https://github.com/pytorch/pytorch/blob/v1.10.0/test/cpp/api/modules.cpp#L1337-L1338
+    x = ones(100)
+    if isempty(rng_kwargs)
+      @test 40 < sum(evalwgrad(m, x)) < 130
+    else
+      # FIXME: this breaks spuriously for MersenneTwister
+      @test_skip 40 < sum(evalwgrad(m, x)) < 130
+    end
+
+    # CPU RNGs map onto CPU ok
+    if isempty(rng_kwargs)
+      @test cpu(m).rng isa Random.TaskLocalRNG
+    else
+      @test cpu(m).rng === only(values(rng_kwargs))
+    end
+  end
+
+  @test AlphaDropout(0.5; active=true).active === true
+  @test_throws Exception AlphaDropout(0.5; active=:something_else)
 end
 
 @testset "BatchNorm" begin
@@ -62,7 +126,7 @@ end
                              2.0 4.0 6.0]
 
     @test Flux.hasaffine(m) == true
-    @test length(params(m)) == 2
+    @test length(Flux.trainables(m)) == 2
 
     @test m.β == [0, 0]  # initβ(2)
     @test m.γ == [1, 1]  # initγ(2)
@@ -90,44 +154,83 @@ end
     #  1.3
     #  1.3
     @test m.σ² ≈ .1 .* var(x, dims=2, corrected=false) .* (3 / 2).+ .9 .* [1., 1.]
-    
+
     x′ = m(x)
     @test isapprox(x′[1], (1 .- 0.3) / sqrt(1.3), atol = 1.0e-5)
+
+    @inferred m(x)
+  end
+
+  let m = BatchNorm(2; track_stats=false), x = Float32[1.0 3.0 5.0; 2.0 4.0 6.0]
+    y = @inferred m(x)
+    # TODO(#2700): NNlib 0.9.41 requires Float32 scale/bias for Float16 input, so
+    # `f16` normalization params are being reworked in Flux.jl#2700. Re-enable then.
+    # m16 = f16(m)
+    # y16 = @inferred m16(f16(x))
+    # @test eltype(y16) == Float16
+    # @test y16 ≈ y  atol=1e-3
+  end
+
+  # A single value per channel has undefined batch variance: error while training
+  # (matching PyTorch) instead of silently producing NaN running stats (issue #1992).
+  let m = BatchNorm(1)
+    trainmode!(m)
+    @test_throws ArgumentError m(zeros(Float32, 1, 1))          # (C=1, N=1) => 1 value/channel
+    @test_throws ArgumentError gradient(m -> sum(m(zeros(Float32, 1, 1))), m)
+    @test m(reshape(Float32[0, 1, 2, 3], 4, 1, 1)) isa AbstractArray  # N=1 but 4 values/channel is fine
+  end
+  let m = BatchNorm(1)
+    testmode!(m)
+    @test m(zeros(Float32, 1, 1)) ≈ zeros(Float32, 1, 1)        # single-sample inference is fine
   end
 
   # with activation function
-  let m = BatchNorm(2, sigmoid), x = [1.0 3.0 5.0;
-                                      2.0 4.0 6.0]
+  let m = BatchNorm(2, sigmoid), x = Float32[1.0 3.0 5.0;
+                                             2.0 4.0 6.0]
     y = m(x)
     @test isapprox(y, sigmoid.((x .- m.μ) ./ sqrt.(m.σ² .+ m.ϵ)), atol = 1.0e-7)
+    @inferred m(x)
+    # TODO(#2700): NNlib 0.9.41 requires Float32 scale/bias for Float16 input, so
+    # `f16` normalization params are being reworked in Flux.jl#2700. Re-enable then.
+    # m16 = f16(m)
+    # y16 = @inferred m16(f16(x))
+    # @test eltype(y16) == Float16
+    # @test y16 ≈ y  atol=1e-3
   end
 
   let m = trainmode!(BatchNorm(2)), x = reshape(Float32.(1:6), 3, 2, 1)
     y = reshape(permutedims(x, [2, 1, 3]), 2, :)
     y = permutedims(reshape(m(y), 2, 3, 1), [2, 1, 3])
     @test m(x) == y
+    @inferred m(x)
   end
 
   let m = trainmode!(BatchNorm(2)), x = reshape(Float32.(1:12), 2, 3, 2, 1)
     y = reshape(permutedims(x, [3, 1, 2, 4]), 2, :)
     y = permutedims(reshape(m(y), 2, 2, 3, 1), [2, 3, 1, 4])
     @test m(x) == y
+    @inferred m(x)
   end
 
   let m = trainmode!(BatchNorm(2)), x = reshape(Float32.(1:24), 2, 2, 3, 2, 1)
     y = reshape(permutedims(x, [4, 1, 2, 3, 5]), 2, :)
     y = permutedims(reshape(m(y), 2, 2, 2, 3, 1), [2, 3, 4, 1, 5])
     @test m(x) == y
+    @inferred m(x)
   end
 
   let m = BatchNorm(32), x = randn(Float32, 416, 416, 32, 1);
     m(x)
     @test (@allocated m(x)) <  100_000_000
+    @inferred m(x)
   end
 
-  @test length(Flux.params(BatchNorm(10))) == 2
-  @test length(Flux.params(BatchNorm(10, affine=true))) == 2
-  @test length(Flux.params(BatchNorm(10, affine=false))) == 0
+  @test length(Flux.trainables(BatchNorm(10))) == 2
+  @test length(Flux.trainables(BatchNorm(10, affine=true))) == 2
+  @test length(Flux.trainables(BatchNorm(10, affine=false))) == 0
+
+  @test BatchNorm(5; active=true).active === true
+  @test_throws Exception BatchNorm(5; active=:something_else)
 end
 
 @testset "InstanceNorm" begin
@@ -135,7 +238,7 @@ end
   let m = InstanceNorm(2; affine=true, track_stats=true), sizes = (3, 2, 2),
         x = reshape(collect(1:prod(sizes)), sizes)
 
-      @test length(params(m)) == 2
+      @test length(Flux.trainables(m)) == 2
       x = Float32.(x)
       @test m.β == [0, 0]  # initβ(2)
       @test m.γ == [1, 1]  # initγ(2)
@@ -173,6 +276,8 @@ end
       @test length(m.μ) == 2
       @test length(m.σ²) == 2
       @test y ≈ (x .- reshape(m.μ, 1,2,1)) ./ sqrt.(reshape(m.σ², 1,2,1) .+ 1f-5)   atol=1.0e-5
+
+      @inferred m(x)
   end
 
   # with activation function
@@ -183,10 +288,12 @@ end
     affine_shape[[1,3]] .= 1
 
     y = evalwgrad(m, x)
-    y = m(x) # inference time after a training step    
+    y = m(x) # inference time after a training step
     μ = reshape(m.μ, affine_shape...)
     σ² = reshape(m.σ², affine_shape...)
     @test y ≈ sigmoid.((x .- μ) ./ sqrt.(σ² .+ m.ϵ))   atol=1.0e-7
+
+    @inferred m(x)
   end
 
   # with activation function
@@ -194,24 +301,28 @@ end
       x = reshape(collect(1:prod(sizes)), sizes)
 
     @test Flux.hasaffine(m) == true
-    @test length(params(m)) == 2  
+    @test length(Flux.trainables(m)) == 2
     x = Float64.(x)
     y = m(x)
     μ = mean(x, dims=1)
     σ² = var(x, dims=1, corrected=false)
     @test y ≈ sigmoid.((x .- μ) ./ sqrt.(σ² .+ m.ϵ))   atol=1.0e-7
+
+    @inferred m(x)
   end
 
   let m = InstanceNorm(2, sigmoid), sizes = (3, 2, 2),
       x = reshape(collect(1:prod(sizes)), sizes)
     @test Flux.hasaffine(m) == false
-    @test length(params(m)) == 0
-    
+    @test length(Flux.trainables(m)) == 0
+
     x = Float64.(x)
     y = m(x)
     μ = mean(x, dims=1)
     σ² = var(x, dims=1, corrected=false)
     @test y ≈ sigmoid.((x .- μ) ./ sqrt.(σ² .+ m.ϵ))   atol=1.0e-7
+
+    @inferred m(x)
   end
 
 
@@ -220,6 +331,8 @@ end
     y = reshape(permutedims(x, [3, 1, 2, 4, 5]), :, 2, 3)
     y = reshape(m(y), sizes...)
     @test m(x) == y
+
+    @inferred m(x)
   end
 
   # check that μ, σ², and the output are the correct size for higher rank tensors
@@ -229,6 +342,8 @@ end
     @test size(m.μ) == (sizes[end - 1], )
     @test size(m.σ²) == (sizes[end - 1], )
     @test size(y) == sizes
+
+    @inferred m(x)
   end
 
   # show that instance norm is equal to batch norm when channel and batch dims are squashed
@@ -240,11 +355,16 @@ end
   let m = InstanceNorm(32), x = randn(Float32, 416, 416, 32, 1);
     m(x)
     @test (@allocated m(x)) <  100_000_000
+
+    @inferred m(x)
   end
 
-  @test length(Flux.params(InstanceNorm(10))) == 0
-  @test length(Flux.params(InstanceNorm(10, affine=true))) == 2
-  @test length(Flux.params(InstanceNorm(10, affine=false))) == 0
+  @test length(Flux.trainables(InstanceNorm(10))) == 0
+  @test length(Flux.trainables(InstanceNorm(10, affine=true))) == 2
+  @test length(Flux.trainables(InstanceNorm(10, affine=false))) == 0
+
+  @test InstanceNorm(5; active=true).active === true
+  @test_throws Exception InstanceNorm(5; active=:something_else)
 end
 
 @testset "LayerNorm" begin
@@ -264,65 +384,69 @@ end
 
   m = LayerNorm((2,3,4))
   @test Flux.hasaffine(m) == true
-  @test length(params(m)) == 2
+  @test length(Flux.trainables(m)) == 2
   m = LayerNorm((2,3,4), affine=false)
   @test Flux.hasaffine(m) == false
-  @test length(params(m)) == 0
+  @test length(Flux.trainables(m)) == 0
+
+  @testset "NNlib.layernorm forward" begin
+    x = randn(Float32, 2, 3, 4)
+    m = LayerNorm((2, 3), tanh)
+    m.diag.scale .= randn(Float32, 2, 3)
+    m.diag.bias .= randn(Float32, 2, 3)
+    @test m(x) ≈ tanh.(m.diag.scale .* Flux.normalise(x; dims=1:2) .+ m.diag.bias)
+    test_gradients(m, x)
+    test_gradients(Chain(Dense(2 => 2), LayerNorm(2, tanh; affine=false)), randn(Float32, 2, 5))
+
+    # a hand-built `Scale` without bias falls back to normalising, then scaling
+    m = LayerNorm(identity, Flux.Scale(Float32[2, 3], false), 1f-5, (2,), true)
+    x = randn(Float32, 2, 5)
+    @test m(x) ≈ Float32[2, 3] .* Flux.normalise(x; dims=1)
+    test_gradients(m, x)
+  end
+
+  @testset "half-precision input" begin
+    m = LayerNorm(3, relu)
+    m.diag.scale .= randn(Float32, 3)
+    m.diag.bias .= randn(Float32, 3)
+    x = randn(Float32, 3, 5)
+    @test f16(m).diag.scale isa Vector{Float32}  # NNlib.layernorm needs Float32 parameters
+    @test bf16(m).diag.bias isa Vector{Float32}
+    y = f16(m)(f16(x))
+    @test y isa Matrix{Float16}  # normalised in Float32, returned in the input's eltype
+    @test y ≈ m(x)  rtol=1e-2
+    @test m(f16(x)) isa Matrix{Float16}
+    dm, dx = gradient((m, x) -> sum(abs2, m(x)), f16(m), f16(x))
+    @test dm.diag.scale isa Vector{Float32}
+    @test dx isa Matrix{Float16}
+  end
 end
 
 @testset "GroupNorm" begin
   # begin tests
   squeeze(x) = dropdims(x, dims = tuple(findall(size(x) .== 1)...)) # To remove all singular dimensions
 
-  let m = GroupNorm(4,2, track_stats=true), sizes = (3,4,2),
+  let m = GroupNorm(4,2), sizes = (3,4,2),
         x = reshape(collect(1:prod(sizes)), sizes)
 
-      @test length(params(m)) == 2
+      @test length(Flux.trainables(m)) == 2
       x = Float32.(x)
       @test m.β == [0, 0, 0, 0]  # initβ(32)
       @test m.γ == [1, 1, 1, 1]  # initγ(32)
 
-      y = evalwgrad(m, x)
+      ŷ = evalwgrad(m, x)
+    
+      @test m.μ === nothing
+      @test m.σ² === nothing
+      ŷ = m(x)
+      y = [-1.4638476 0.29276943 -1.4638476 0.29276943; -0.87830865 0.87830853 -0.8783088 0.8783083; -0.29276967 1.4638474 -0.2927699 1.4638472;;; -1.4638476 0.29276943 -1.4638472 0.29276943; -0.8783083 0.8783083 -0.8783083 0.8783083; -0.29276943 1.4638472 -0.29276943 1.4638472]
 
-      #julia> x
-      #[:, :, 1]  =
-      # 1.0  4.0  7.0  10.0
-      # 2.0  5.0  8.0  11.0
-      # 3.0  6.0  9.0  12.0
-      #
-      #[:, :, 2] =
-      # 13.0  16.0  19.0  22.0
-      # 14.0  17.0  20.0  23.0
-      # 15.0  18.0  21.0  24.0
-      #
-      # μ will be
-      # (1. + 2. + 3. + 4. + 5. + 6.) / 6 = 3.5
-      # (7. + 8. + 9. + 10. + 11. + 12.) / 6 = 9.5
-      #
-      # (13. + 14. + 15. + 16. + 17. + 18.) / 6 = 15.5
-      # (19. + 20. + 21. + 22. + 23. + 24.) / 6 = 21.5
-      #
-      # μ =
-      # 3.5   15.5
-      # 9.5   21.5
-      #
-      # ∴ update rule with momentum:
-      # (1. - .1) * 0 + .1 * (3.5 + 15.5) / 2 = 0.95
-      # (1. - .1) * 0 + .1 * (9.5 + 21.5) / 2 = 1.55
-      @test m.μ ≈ [0.95, 1.55]
-      n = prod(size(x)) ÷ m.G ÷ size(x)[end]
-      corr = n / (n-1)
-      z = reshape(x,3,2,2,2)
-      σ² = var(z, dims=(1,2), corrected=false)
-      @test m.σ² ≈ 0.1*corr*vec(mean(σ², dims=4)) .+ 0.9 * 1
-
-      y = m(x)
-      out = (z .- reshape(m.μ, 1,1,2,1)) ./ sqrt.(reshape(m.σ², 1,1,2,1) .+ 1f-5)
-      @test y ≈ reshape(out, size(x))   atol=1.0e-5
+      @test ŷ ≈ y   atol=1.0e-5
   end
   # with activation function
-  let m = GroupNorm(4,2, sigmoid, track_stats=true), sizes = (3, 4, 2),
+  let m = GroupNorm(4,2, sigmoid), sizes = (3, 4, 2),
       x = reshape(collect(1:prod(sizes)), sizes)
+    
     x = Float32.(x)
     μ_affine_shape = ones(Int,length(sizes) + 1)
     μ_affine_shape[end-1] = 2 # Number of groups
@@ -335,26 +459,16 @@ end
 
     og_shape = size(x)
 
-    y = m(x)
-    x_ = reshape(x,affine_shape...)
-    out = reshape(sigmoid.((x_ .- reshape(m.μ,μ_affine_shape...)) ./ sqrt.(reshape(m.σ²,μ_affine_shape...) .+ m.ϵ)),og_shape)
-    @test y ≈ out   atol=1e-7
+    ŷ = m(x)
+    y = [0.18787955 0.57267404 0.18787955 0.57267404; 0.2935284 0.70647156 0.29352835 0.70647156; 0.42732593 0.81212044 0.42732587 0.8121204;;; 0.18787955 0.57267404 0.1878796 0.57267404; 0.29352847 0.70647156 0.29352847 0.70647156; 0.42732602 0.8121204 0.42732602 0.8121204]
+    @test ŷ ≈ y   atol=1e-5  # loosened from 1e-7: NNlib.groupnorm Float32 reduction rounds differently than the frozen literals (agreement ~1e-7)
   end
 
-  let m = trainmode!(GroupNorm(2,2, track_stats=true)), sizes = (2, 4, 1, 2, 3),
+  let m = trainmode!(GroupNorm(2,2)), sizes = (2, 4, 1, 2, 3),
       x = Float32.(reshape(collect(1:prod(sizes)), sizes))
     y = reshape(permutedims(x, [3, 1, 2, 4, 5]), :, 2, 3)
     y = reshape(m(y), sizes...)
     @test m(x) == y
-  end
-
-  # check that μ, σ², and the output are the correct size for higher rank tensors
-  let m = GroupNorm(4,2, track_stats=true), sizes = (5, 5, 3, 4, 4, 6),
-      x = Float32.(reshape(collect(1:prod(sizes)), sizes))
-    y = evalwgrad(m, x)
-    @test size(m.μ) == (m.G,)
-    @test size(m.σ²) == (m.G,)
-    @test size(y) == sizes
   end
 
   # show that group norm is the same as instance norm when the group size is the same as the number of channels
@@ -368,4 +482,96 @@ end
       x = Float32.(reshape(collect(1:prod(sizes)), sizes))
     @test BN(x) ≈ GN(x)
   end
+
+  @test GroupNorm(5, 5; active=true).active === true
+  @test_throws Exception GroupNorm(5, 5; active=:something_else)
+end
+
+@testset "norm layers with too few dimensions" begin
+  # channels are along ndims(x)-1, so a vector has none, and the error should say so
+  for (m, d, x) in ((BatchNorm(3), 2, rand(Float32, 3)),
+                    (InstanceNorm(3), 3, rand(Float32, 3)),
+                    (InstanceNorm(3), 3, rand(Float32, 3, 2)),
+                    (GroupNorm(4, 2), 3, rand(Float32, 4)),
+                    (GroupNorm(4, 2), 3, rand(Float32, 4, 2)))
+    @test_throws DimensionMismatch m(x)
+    msg = try m(x); "" catch e; sprint(showerror, e) end
+    @test occursin("ndims(input) >= $d", msg)
+  end
+end
+
+@testset "normalisation dimension checks in outputsize" begin
+  @test_throws DimensionMismatch outputsize(BatchNorm(3), (3,))
+  @test_throws DimensionMismatch outputsize(InstanceNorm(3), (3, 2))
+  @test_throws DimensionMismatch outputsize(GroupNorm(4, 2), (4, 2))
+
+  @test_throws DimensionMismatch Zygote.gradient(x -> sum(BatchNorm(3)(x)), rand(Float32, 3))
+
+  # Each layer accepts its minimum number of dimensions.
+  xbn = rand(Float32, 3, 2)
+  xin = rand(Float32, 2, 3, 2)
+  xgn = rand(Float32, 2, 4, 2)
+  @test size(BatchNorm(3)(xbn)) == size(xbn)
+  @test size(InstanceNorm(3)(xin)) == size(xin)
+  @test size(GroupNorm(4, 2)(xgn)) == size(xgn)
+  @test outputsize(BatchNorm(3), size(xbn)) == size(xbn)
+  @test outputsize(InstanceNorm(3), size(xin)) == size(xin)
+  @test outputsize(GroupNorm(4, 2), size(xgn)) == size(xgn)
+end
+
+@testset "second derivatives" begin
+  m1 = Dropout(0.5)
+  @test Zygote.hessian_reverse(sum∘m1, [1.0,2.0,3.0]) == zeros(3, 3)
+
+  m2 = Chain(BatchNorm(3), sum)
+  @test Zygote.hessian_reverse(m2, Float32[1 2; 3 4; 5 6]) == zeros(Float32, 6, 6)
+end
+
+@testset "ForwardDiff" begin
+  bn = BatchNorm(3)
+  @test ForwardDiff.jacobian(bn, rand(Float32, 3, 4)) isa Matrix{Float32}
+  # iszero(bn.μ)  # is true. But ideally would not be, if Flux would automatically choose trainmode
+  Flux.trainmode!(bn)
+  # This was an error, https://github.com/FluxML/Flux.jl/issues/2122
+  @test ForwardDiff.jacobian(bn, rand(Float32, 3, 4)) isa Matrix{Float32}
+  @test !iszero(bn.μ)
+
+  # Easy case of 2122, gradient with x
+  x5 = rand(Float32, 5, 3)
+  bn1 = BatchNorm(5, relu)
+  bn2 = BatchNorm(5, relu)
+  g1 = Zygote.gradient(x -> sum(abs2, bn1(x)), x5)[1]
+  g2 = ForwardDiff.gradient(x -> sum(abs2, bn2(x)), x5)
+  @test g1 ≈ g2
+
+  # Harder case? 
+  v1, re1 = Flux.destructure(BatchNorm(5, relu));
+  g1 = Zygote.gradient(v -> sum(abs2, re1(v)(x5)), v1)[1]
+
+  v2, re2 = Flux.destructure(BatchNorm(5, relu));
+  g2 = ForwardDiff.gradient(v -> sum(abs2, re2(v)(x5)), v2)
+end
+
+@testset "normalization testsuite" begin
+  include("../test_common/normalization.jl")
+  normalization_testsuite(cpu)
+end
+
+@testset "WeightNorm with dims = :" begin
+  # https://github.com/FluxML/Flux.jl/issues/2796
+  wn = WeightNorm(Dense(2 => 3); dims = :)
+  @test wn.g isa AbstractArray
+  @test size(wn.g) == (1, 1)
+  @test wn.g[] ≈ sqrt(sum(abs2, wn.layer.weight)) rtol=1f-6
+
+  x = rand(Float32, 2, 4)
+  @test wn(x) ≈ wn.layer(x)  # `g` starts at the norm of the weight
+  @test Flux.remove_weight_norms(wn)(x) ≈ wn(x)
+
+  opt = Flux.setup(Adam(0.1), wn)
+  @test opt.g isa Optimisers.Leaf
+  g_before = copy(wn.g)
+  grad = gradient(m -> sum(abs2, m(x)), wn)[1]
+  Flux.update!(opt, wn, grad)
+  @test wn.g != g_before
 end

@@ -1,0 +1,368 @@
+@testset "Flux.train! on Reactant device" begin
+    dev = MLDataDevices.reactant_device(force=true)
+    cpu = cpu_device()
+
+    model0 = Chain(Dense(4 => 8, tanh), Dense(8 => 2))
+    X = randn(Float32, 4, 16)
+    Y = randn(Float32, 2, 16)
+
+    # Move the model to the device *before* `setup`, so the optimiser rule is auto-wrapped for
+    # Reactant (keeps Adam's βt as an on-device tracked number rather than a frozen constant).
+    model = model0 |> dev
+    x, y = X |> dev, Y |> dev
+    opt = Flux.setup(Adam(1f-2), model)
+
+    loss(m, a, b) = Flux.mse(m(a), b)
+
+    l0 = Reactant.to_number(Reactant.@jit loss(model, x, y))
+    w0 = model.layers[1].weight |> cpu
+
+    # Fixed batch shape → the step is compiled once and reused across all iterations.
+    data = [(x, y) for _ in 1:30]
+    Flux.train!(loss, model, data, opt)
+
+    l1 = Reactant.to_number(Reactant.@jit loss(model, x, y))
+    w1 = model.layers[1].weight |> cpu
+
+    @test l1 < l0            # loss decreased
+    @test !(w0 ≈ w1)         # parameters were updated in place
+
+    # A smaller final batch forces a second compile — the shape-keyed cache must handle it.
+    x2, y2 = (X[:, 1:8] |> dev), (Y[:, 1:8] |> dev)
+    data2 = [(x, y), (x, y), (x2, y2)]   # two shapes in one call
+    @test Flux.train!(loss, model, data2, opt) === nothing
+
+    # Host-resident data must be rejected on the Reactant path.
+    @test_throws ArgumentError Flux.train!(loss, model, [(X, Y)], opt)
+end
+
+@testset "Flux.trainstep! on Reactant device" begin
+    dev = MLDataDevices.reactant_device(force=true)
+    cpu = cpu_device()
+
+    model0 = Chain(Dense(4 => 8, tanh), Dense(8 => 2))
+    X = randn(Float32, 4, 16)
+    Y = randn(Float32, 2, 16)
+
+    model = model0 |> dev
+    x, y = X |> dev, Y |> dev
+    opt = Flux.setup(Adam(1f-2), model)
+
+    loss(m, a, b) = Flux.mse(m(a), b)
+
+    l0 = Reactant.to_number(Reactant.@jit loss(model, x, y))
+    w0 = model.layers[1].weight |> cpu
+
+    # `trainstep!` returns just the loss, on the device, mutating model/opt in place.
+    l = Flux.trainstep!(loss, model, (x, y), opt)
+    @test l isa Reactant.AbstractConcreteNumber{Float32} && isfinite(l)
+    @test l ≈ l0                               # measured before the update
+    @test !(w0 ≈ model.layers[1].weight |> cpu)            # parameters updated in place
+
+    # `trainstep_withgradient!` also returns the on-device gradient.
+    l2, g = Flux.trainstep_withgradient!(loss, model, (x, y), opt)
+    @test l2 isa Reactant.AbstractConcreteNumber{Float32} && isfinite(l2)
+    @test Flux.get_device_type(g) <: Flux.ReactantDevice   # gradient stays on the device
+
+    # Looping trainstep! keeps reducing the loss (reuses the cached executable).
+    for _ in 1:30
+        Flux.trainstep!(loss, model, (x, y), opt)
+    end
+    @test Reactant.to_number(Reactant.@jit loss(model, x, y)) < l0
+    @test !haskey(Flux.Train.STEP_PACERS, objectid(Flux.Train._first_param(model)))   # XLA owns the buffers
+
+    # Host-resident data must be rejected by both entry points.
+    @test_throws ArgumentError Flux.trainstep!(loss, model, (X, Y), opt)
+    @test_throws ArgumentError Flux.trainstep_withgradient!(loss, model, (X, Y), opt)
+end
+
+@testset "Flux.trainstep! with a structured (non-array) batch element" begin
+    dev = MLDataDevices.reactant_device(force=true)
+
+    model = Dense(4 => 2) |> dev
+    # The batch element is a NamedTuple of arrays, not a bare array — the compile-cache key must
+    # summarise its shape by recursing through the leaves rather than calling `size` on it directly.
+    nt = (x = randn(Float32, 4, 8), y = randn(Float32, 2, 8)) |> dev
+    opt = Flux.setup(Adam(1f-2), model)
+    lossnt(m, b) = Flux.mse(m(b.x), b.y)
+
+    l0 = Reactant.to_number(Reactant.@jit lossnt(model, nt))
+    # Exercise both compiled variants (loss-only and with-gradient) with the structured batch.
+    l, g = Flux.trainstep_withgradient!(lossnt, model, (nt,), opt)
+    @test l isa Reactant.AbstractConcreteNumber && isfinite(l)
+    @test Flux.get_device_type(g) <: Flux.ReactantDevice
+    for _ in 1:20
+        Flux.trainstep!(lossnt, model, (nt,), opt)
+    end
+    @test Reactant.to_number(Reactant.@jit lossnt(model, nt)) < l0
+end
+
+@testset "auxiliary loss outputs on Reactant" begin
+    dev = MLDataDevices.reactant_device(force=true)
+
+    model = Chain(Dense(4 => 8, tanh), Dense(8 => 2)) |> dev
+    x, y = randn(Float32, 4, 16) |> dev, randn(Float32, 2, 16) |> dev
+    opt = Flux.setup(Adam(1f-2), model)
+
+    scalarloss(m, a, b) = Flux.mse(m(a), b)
+    # loss returns (scalar loss, NamedTuple of a device-computed statistic)
+    auxloss(m, a, b) = (Flux.mse(m(a), b), (; sumsq = sum(abs2, m(a))))
+
+    l0 = Reactant.to_number(Reactant.@jit scalarloss(model, x, y))
+
+    v = Flux.trainstep!(auxloss, model, (x, y), opt)
+    @test v isa Tuple                                              # full value returned
+    @test v[1] isa Reactant.AbstractConcreteNumber && isfinite(v[1])   # scalar loss, on the device
+    @test v[1] ≈ l0                                               # measured before the update
+    @test v[2].sumsq isa Reactant.AbstractConcreteNumber && isfinite(v[2].sumsq)   # aux too
+
+    # with-gradient variant: same value shape, gradient stays on the device too
+    v2, g = Flux.trainstep_withgradient!(auxloss, model, (x, y), opt)
+    @test v2 isa Tuple && v2[1] isa Reactant.AbstractConcreteNumber && isfinite(v2[1])
+    @test v2[2].sumsq isa Reactant.AbstractConcreteNumber
+    @test Flux.get_device_type(g) <: Flux.ReactantDevice
+
+    # differentiating `first∘loss`, training with the aux loss still reduces the loss
+    for _ in 1:20
+        Flux.trainstep!(auxloss, model, (x, y), opt)
+    end
+    @test Reactant.to_number(Reactant.@jit scalarloss(model, x, y)) < l0
+
+    # `train!` over an aux-returning loss runs (it guards on the scalar and discards the aux)
+    @test Flux.train!(auxloss, model, [(x, y) for _ in 1:5], opt) === nothing
+end
+
+@testset "BatchNorm running stats update once per Reactant step" begin
+    dev = MLDataDevices.reactant_device(force=true)
+
+    # A bare BatchNorm's running-stat update depends only on the input batch, so a single forward
+    # performs exactly one momentum update. This guards against evaluating the loss twice per step
+    # (which would double the update) for stateful layers — see `_reactant_valgrad`.
+    mk() = (m = BatchNorm(4); trainmode!(m); m)
+    X = randn(Float32, 4, 16)
+
+    # Independent reference: one plain forward ⇒ one update (no AD, can't hit the same code path).
+    ref = mk(); ref(X)
+
+    # scalar loss, and a loss returning (loss, aux) — both must still update the stats exactly once.
+    for lossf in ((m, a) -> sum(abs2, m(a)),
+                  (m, a) -> (y = m(a); (sum(abs2, y), sum(y))))
+        m = mk() |> dev
+        opt = Flux.setup(Descent(0f0), m)   # zero LR isolates the stat update from parameter changes
+        Flux.trainstep!(lossf, m, (X |> dev,), opt)
+        @test Array(m.μ)  ≈ ref.μ           # one update, not two
+        @test Array(m.σ²) ≈ ref.σ²
+    end
+end
+
+@testset "conv + BatchNorm trainstep! matches eager" begin
+    dev = MLDataDevices.reactant_device(force=true)
+    cpu = cpu_device()
+
+    model0 = Chain(Conv((3, 3), 2 => 4, relu; pad=1), BatchNorm(4), Conv((3, 3), 4 => 2; pad=1))
+    X = randn(Float32, 8, 8, 2, 4)
+    Y = randn(Float32, 8, 8, 2, 4)
+    # reduces a conv output with many elements straight to a scalar
+    loss(m, a, b) = Flux.mse(m(a), b)
+
+    eager = trainmode!(deepcopy(model0))
+    model = trainmode!(deepcopy(model0)) |> dev
+    x, y = X |> dev, Y |> dev
+    # Descent rather than Adam: Adam turns numerical noise on exactly-zero gradients into full steps.
+    opt_eager = Flux.setup(Descent(1f-1), eager)
+    opt = Flux.setup(Descent(1f-1), model)
+
+    for _ in 1:5
+        l_eager = Flux.trainstep!(loss, eager, (X, Y), opt_eager)
+        l = Flux.trainstep!(loss, model, (x, y), opt)
+        @test l ≈ l_eager rtol=1e-3
+    end
+    for (p, q) in zip(Flux.trainables(model |> cpu), Flux.trainables(eager))
+        @test p ≈ q rtol=1e-3
+    end
+    @test Array(model[2].μ) ≈ eager[2].μ rtol=1e-3
+    @test Array(model[2].σ²) ≈ eager[2].σ² rtol=1e-3
+end
+
+@testset "Reactant compile-cache auto-eviction" begin
+    dev = MLDataDevices.reactant_device(force=true)
+    ext = Base.get_extension(Flux, :FluxReactantExt)
+    @test ext !== nothing
+    loss(m, a, b) = Flux.mse(m(a), b)
+
+    empty!(ext.COMPILE_CACHE)   # clean slate for deterministic counts
+
+    # Compile a step for a fresh model and return only the model, so the batch/optimiser locals are
+    # function-scoped and don't leak into this testset (which would keep them, and the model, alive).
+    compile_one() = let model = Chain(Dense(4 => 8, tanh), Dense(8 => 2)) |> dev
+        x, y = randn(Float32, 4, 16) |> dev, randn(Float32, 2, 16) |> dev
+        opt = Flux.setup(Adam(1f-2), model)
+        Flux.trainstep!(loss, model, (x, y), opt)
+        model
+    end
+
+    models = Any[compile_one() for _ in 1:3]
+    @test length(ext.COMPILE_CACHE) == 3   # one entry per distinct model
+
+    # Once the models are unreachable and collected, their entries (and executables) are evicted. We
+    # assert `<= 1` rather than `== 0` only because Julia's GC is conservative about the most recently
+    # created object, whose reference can linger on the stack; the point is that the dropped models'
+    # entries are freed, not retained for the session.
+    empty!(models)
+    GC.gc(true); GC.gc(true)
+    ext._prune_compile_cache!()
+    @test length(ext.COMPILE_CACHE) <= 1
+
+    # A live model keeps *its* entry across pruning (and keeps training).
+    model = Chain(Dense(4 => 8, tanh), Dense(8 => 2)) |> dev
+    x, y = randn(Float32, 4, 16) |> dev, randn(Float32, 2, 16) |> dev
+    opt = Flux.setup(Adam(1f-2), model)
+    l0 = Reactant.to_number(Reactant.@jit loss(model, x, y))
+    for _ in 1:20
+        Flux.trainstep!(loss, model, (x, y), opt)
+    end
+    l1 = Reactant.to_number(Reactant.@jit loss(model, x, y))
+    GC.gc(true)
+    ext._prune_compile_cache!()
+    handle = first(Flux.trainables(model))
+    @test any(v -> v[1].value === handle, values(ext.COMPILE_CACHE))   # this model's entry survived
+    @test l1 < l0
+end
+
+@testset "Reactant compile-cache growth warning" begin
+    dev = MLDataDevices.reactant_device(force=true)
+    ext = Base.get_extension(Flux, :FluxReactantExt)
+    loss(m, a, b) = Flux.mse(m(a), b)
+
+    empty!(ext.COMPILE_CACHE)
+    # Fill the cache to the warning threshold with live dummy entries. `handles` keeps them reachable
+    # so the prune pass on the next lookup won't drop them, letting us hit the threshold with a single
+    # real compile instead of eleven.
+    handles = [Ref(0) for _ in 1:ext.COMPILE_CACHE_WARN]
+    for (i, h) in enumerate(handles)
+        ext.COMPILE_CACHE[(:dummy, i)] = (WeakRef(h), nothing)
+    end
+    @test length(ext.COMPILE_CACHE) == ext.COMPILE_CACHE_WARN
+
+    # Compiling one more distinct step pushes the cache past the threshold and must warn.
+    model = Dense(2 => 2) |> dev
+    x, y = randn(Float32, 2, 4) |> dev, randn(Float32, 2, 4) |> dev
+    opt = Flux.setup(Adam(1f-2), model)
+    @test_logs (:warn,) match_mode=:any Flux.trainstep!(loss, model, (x, y), opt)
+    @test length(ext.COMPILE_CACHE) == ext.COMPILE_CACHE_WARN + 1
+
+    empty!(ext.COMPILE_CACHE)   # leave a clean cache for other testsets
+end
+
+@testset "AD backend resolution on Reactant" begin
+    dev = MLDataDevices.reactant_device(force=true)
+    ext = Base.get_extension(Flux, :FluxReactantExt)
+    loss(m, a, b) = Flux.mse(m(a), b)
+
+    model = Chain(Dense(4 => 8, tanh), Dense(8 => 2)) |> dev
+    x, y = randn(Float32, 4, 16) |> dev, randn(Float32, 2, 16) |> dev
+    opt = Flux.setup(Adam(1f-2), model)
+
+    empty!(ext.COMPILE_CACHE)
+    l0 = Reactant.to_number(Reactant.@jit loss(model, x, y))
+
+    # No `adtype` ⇒ the default on a Reactant device is Enzyme (compiles one executable).
+    Flux.trainstep!(loss, model, (x, y), opt)
+    @test length(ext.COMPILE_CACHE) == 1
+
+    # An explicit `AutoEnzyme()` is the same backend, so it reuses that executable rather than
+    # compiling a second one (the cache key includes `typeof(adtype)`).
+    Flux.trainstep!(loss, AutoEnzyme(), model, (x, y), opt)
+    @test length(ext.COMPILE_CACHE) == 1
+
+    # ...and it trains (Enzyme reverse pass under Reactant's ABI).
+    for _ in 1:20
+        Flux.trainstep!(loss, AutoEnzyme(), model, (x, y), opt)
+    end
+    @test Reactant.to_number(Reactant.@jit loss(model, x, y)) < l0
+end
+
+@testset "Duplicated model rejected on Reactant" begin
+    dev = MLDataDevices.reactant_device(force=true)
+    model = Chain(Dense(4 => 8, tanh), Dense(8 => 2)) |> dev
+    x, y = randn(Float32, 4, 16) |> dev, randn(Float32, 2, 16) |> dev
+    loss(m, a, b) = Flux.mse(m(a), b)
+    opt = Flux.setup(Adam(1f-2), model)
+
+    # A `Duplicated` model on a Reactant device is an error at resolution time, for every entry point
+    # (pass the plain device-resident model instead — Enzyme is applied internally).
+    dmodel = Duplicated(model, Enzyme.make_zero(model))
+    @test_throws ArgumentError Flux.trainstep!(loss, dmodel, (x, y), opt)
+    @test_throws ArgumentError Flux.trainstep_withgradient!(loss, dmodel, (x, y), opt)
+    @test_throws ArgumentError Flux.train!(loss, dmodel, [(x, y)], opt)
+end
+
+@testset "cached step is not reused when traced constants change" begin
+    dev = MLDataDevices.reactant_device(force=true)
+    X, Y = randn(Float32, 4, 16), randn(Float32, 2, 16)
+    x, y = X |> dev, Y |> dev
+    loss(m, a, b) = Flux.mse(m(a), b)
+    mk() = Chain(Dense(4 => 8, tanh), Dense(8 => 2)) |> dev
+    weight(m) = Array(m.layers[1].weight)
+
+    @testset "freeze! and thaw! after compiling" begin
+        m = mk()
+        opt = Flux.setup(Adam(1f-2), m)
+        Flux.trainstep!(loss, m, (x, y), opt)
+        Flux.freeze!(opt.layers[1])
+        w = weight(m)
+        Flux.trainstep!(loss, m, (x, y), opt)
+        @test weight(m) == w
+        Flux.thaw!(opt.layers[1])
+        Flux.trainstep!(loss, m, (x, y), opt)
+        @test weight(m) != w
+    end
+
+    @testset "testmode! after compiling" begin
+        m = Chain(Dense(4 => 4), BatchNorm(4)) |> dev
+        trainmode!(m)
+        opt = Flux.setup(Descent(0f0), m)
+        sq(m, a) = sum(abs2, m(a))
+        Flux.trainstep!(sq, m, (x,), opt)
+        μ = Array(m[2].μ)
+        testmode!(m)
+        Flux.trainstep!(sq, m, (x,), opt)
+        @test Array(m[2].μ) == μ   # running stats are not updated in test mode
+    end
+
+    @testset "aliased batch arrays" begin
+        m = Dense(4 => 4) |> dev
+        opt = Flux.setup(Descent(0f0), m)
+        Y4 = randn(Float32, 4, 16)
+        Flux.trainstep!(loss, m, (x, x), opt)
+        @test Flux.trainstep!(loss, m, (x, Y4 |> dev), opt) ≈ Flux.mse((m |> cpu_device())(X), Y4)
+    end
+
+    @testset "redefined loss" begin
+        m = mk()
+        opt = Flux.setup(Descent(0f0), m)
+        @eval redefined_loss(m, a, b) = Flux.mse(m(a), b)
+        l = Base.invokelatest(Flux.trainstep!, redefined_loss, m, (x, y), opt)
+        @eval redefined_loss(m, a, b) = 2 * Flux.mse(m(a), b)
+        @test Base.invokelatest(Flux.trainstep!, redefined_loss, m, (x, y), opt) ≈ 2l
+    end
+
+    @testset "device scalars in the batch are runtime inputs" begin
+        ext = Base.get_extension(Flux, :FluxReactantExt)
+        m = mk()
+        opt = Flux.setup(Descent(0f0), m)
+        scaled(m, a, b, s) = s * Flux.mse(m(a), b)
+        ls = [Flux.trainstep!(scaled, m, (x, y, Reactant.ConcreteRNumber(s)), opt) for s in (1f0, 2f0, 3f0)]
+        # Count this model's entries only: a step may prune those of earlier, collected models.
+        handle = first(Flux.trainables(m))
+        @test count(v -> v[1].value === handle, values(ext.COMPILE_CACHE)) == 1
+        @test ls ≈ ls[1] .* [1, 2, 3]
+    end
+
+    @testset "array-valued loss is an error" begin
+        m = mk()
+        opt = Flux.setup(Descent(0f0), m)
+        @test_throws ArgumentError Flux.trainstep!((m, a, b) -> m(a) .- b, m, (x, y), opt)
+        @test_throws ArgumentError Flux.trainstep!((m, a, b) -> (m(a) .- b, 1), m, (x, y), opt)
+    end
+end

@@ -1,7 +1,3 @@
-using Flux, Test
-using Flux: maxpool, meanpool
-using Flux: gradient
-
 @testset "Pooling" begin
   x = randn(Float32, 10, 10, 3, 2)
   y = randn(Float32, 20, 20, 3, 2)
@@ -13,6 +9,11 @@ using Flux: gradient
   @test ampy(y) == maxpool(y, PoolDims(y, (2, 4)))
   ampy = AdaptiveMeanPool((10, 5))
   @test ampy(y) == meanpool(y, PoolDims(y, (2, 4)))
+  # output larger than the input should give a clear error, not a DivideError
+  @test_throws DimensionMismatch AdaptiveMaxPool((5,))(rand(Float32, 3, 1, 1))
+  @test_throws DimensionMismatch AdaptiveMeanPool((5,))(rand(Float32, 3, 1, 1))
+  @test_throws DimensionMismatch AdaptiveMeanPool((2, 20))(x)
+  @test size(AdaptiveMeanPool((3,))(rand(Float32, 3, 1, 1))) == (3, 1, 1)
   gmp = GlobalMaxPool()
   @test size(gmp(x)) == (1, 1, 3, 2)
   gmp = GlobalMeanPool()
@@ -26,9 +27,9 @@ end
 @testset "CNN" begin
   r = zeros(Float32, 28, 28, 1, 5)
   m = Chain(
-    Conv((2, 2), 1=>16, relu),
+    Conv((2, 2), 1 => 16, relu),
     MaxPool((2,2)),
-    Conv((2, 2), 16=>8, relu),
+    Conv((2, 2), 16 => 8, relu),
     MaxPool((2,2)),
     x -> reshape(x, :, size(x, 4)),
     Dense(288, 10), softmax)
@@ -43,28 +44,96 @@ end
   @test sum(op) == prod(size(op))
 
   @testset "No bias mapped through $lmap" for lmap in (identity, cpu, f32)
-    bias = Conv((2,2), 1=>3, bias = false) |> lmap
-    op = bias(ip)
+    model = Conv((2,2), 1=>3, bias = false) |> lmap
+    op = model(ip)
     @test sum(op) ≈ 0.f0
-    gs = gradient(() -> sum(bias(ip)), Flux.params(bias))
-    @test bias.bias ∉ gs.params
+    g = gradient(m -> sum(m(ip)), model)[1]
+    @test g.bias isa Nothing
   end
 
-  # Train w/o bias and make sure no convergence happens
-  # when only bias can be converged
-  bias = Conv((2, 2), 1=>3, bias = false);
-  ip = zeros(Float32, 28,28,1,1)
-  op = zeros(Float32, 27,27,3,1) .+ 2.f0
-  opt = Descent()
+  @testset "no bias train" begin
+    # Train w/o bias and make sure no convergence happens
+    # when only bias can be converged
+    model = Conv((2, 2), 1=>3, bias = false);
+    ip = zeros(Float32, 28,28,1,1)
+    op = zeros(Float32, 27,27,3,1) .+ 2.f0
+    opt_state = Flux.setup(Descent(), model)
 
-  for _ = 1:10^3
-    gs = gradient(params(bias)) do
-      Flux.Losses.mse(bias(ip), op)
+    for _ = 1:10^3
+      g = gradient(model) do m
+        Flux.mse(m(ip), op)
+      end[1]
+      Flux.update!(opt_state, model, g)
     end
-    Flux.Optimise.update!(opt, params(bias), gs)
+
+    @test Flux.Losses.mse(model(ip), op) ≈ 4.f0
   end
 
-  @test Flux.Losses.mse(bias(ip), op) ≈ 4.f0
+  @testset "Grouped Conv" begin
+    ip = rand(Float32, 28, 100, 2)
+    c = Conv((3,), 100 => 25, groups = 5)
+    @test size(c.weight) == (3, 20, 25)
+    @test size(c(ip)) == (26, 25, 2)
+
+    ip = rand(Float32, 28, 28, 100, 2)
+    c = Conv((3,3), 100 => 25, groups = 5)
+    @test size(c.weight) == (3, 3, 20, 25)
+    @test size(c(ip)) == (26, 26, 25, 2)
+
+    ip = rand(Float32, 10, 11, 12, 100, 2)
+    c = Conv((3,4,5), 100 => 25, groups = 5)
+    @test size(c.weight) == (3,4,5, 20, 25)
+    @test size(c(ip)) == (8,8,8, 25, 2)
+
+    # Test that we cannot ask for non-integer multiplication factors
+    @test_throws AssertionError Conv((2, 2), 3=>10, groups=2)
+    @test_throws AssertionError Conv((2, 2), 2=>9, groups=2)
+
+    # Test that Conv throws a DimensionMismatch error when the initializer 
+    # produces a tensor with an incorrect shape.
+    @test_throws DimensionMismatch Conv(
+      (3, 3),
+      1 => 1;
+      init = (_...) -> rand(3, 3, 1),
+    )
+  end
+end
+
+@testset "_channels_in, _channels_out" begin
+    _channels_in = Flux._channels_in
+    _channels_out = Flux._channels_out
+    @test _channels_in(Conv((3,)   , 2=>4)) == 2
+    @test _channels_in(Conv((5,6,) , 2=>4)) == 2
+    @test _channels_in(Conv((1,2,3), 2=>4)) == 2
+    @test _channels_out(Conv((3,)   , 2=>4)) == 4
+    @test _channels_out(Conv((5,6,) , 2=>4)) == 4
+    @test _channels_out(Conv((1,2,3), 2=>4)) == 4
+
+    @test _channels_in( ConvTranspose((3,)   , 1=>4)) == 1
+    @test _channels_in( ConvTranspose((5,6,) , 2=>4)) == 2
+    @test _channels_in( ConvTranspose((1,2,3), 3=>4)) == 3
+    @test _channels_out(ConvTranspose((3,)   , 2=>1)) == 1
+    @test _channels_out(ConvTranspose((5,6,) , 2=>2)) == 2
+    @test _channels_out(ConvTranspose((1,2,3), 2=>3)) == 3
+
+    @test _channels_in( ConvTranspose((6,)   , 8=>4, groups=4)) == 8
+    @test _channels_in( ConvTranspose((5,6,) , 2=>4, groups=2)) == 2
+    @test _channels_in( ConvTranspose((1,2,3), 3=>6, groups=3)) == 3
+
+    @test _channels_out(ConvTranspose((1,)   , 10=>15, groups=5)) == 15
+    @test _channels_out(ConvTranspose((3,2)   , 10=>15, groups=5)) == 15
+    @test _channels_out(ConvTranspose((5,6,) , 2=>2, groups=2)) == 2
+
+    for Layer in [Conv, ConvTranspose]
+        for _ in 1:10
+            groups = rand(1:10)
+            kernel_size = Tuple(rand(1:5) for _ in rand(1:3))
+            cin = rand(1:5) * groups
+            cout = rand(1:5) * groups
+            @test _channels_in(Layer(kernel_size, cin=>cout; groups)) == cin
+            @test _channels_out(Layer(kernel_size, cin=>cout; groups)) == cout
+        end
+    end
 end
 
 @testset "asymmetric padding" begin
@@ -80,6 +149,58 @@ end
   @test y_hat[1, end] ≈ 3.0
   @test y_hat[1, end-1] ≈ 6.0
   @test y_hat[end, end] ≈ 2.0
+end
+
+@testset "pad_mode $pad_mode" for pad_mode in (:circular, :reflect, :replicate, :symmetric) begin
+  padfun = Dict(:circular => pad_circular, :reflect => pad_reflect,
+                :replicate => pad_repeat, :symmetric => pad_symmetric)[pad_mode]
+
+  @testset "$ltype $(nd)D" for ltype in (Conv, CrossCor, DepthwiseConv), nd in (1, 2, 3)
+    kernel = ntuple(_ -> 3, nd)
+    # small input: test_gradients' finite-difference reference scales with its length
+    x = randn(Float32, ntuple(_ -> 5, nd)..., 2, 1)
+    l = ltype(kernel, 2=>2; pad=1, pad_mode)
+    # a non-zero pad_mode == prepadding the input then convolving with pad=0
+    l0 = l isa CrossCor ?
+      CrossCor(l.weight, l.bias, l.σ; stride=l.stride, pad=0, dilation=l.dilation) :
+      Conv(l.weight, l.bias, l.σ; stride=l.stride, pad=0, dilation=l.dilation, groups=l.groups)
+    xp = padfun(x, ntuple(_ -> 1, 2nd); dims=(nd == 1 ? 1 : ntuple(identity, nd)))
+    @test l(x) ≈ l0(xp)
+    @test size(l(x))[1:nd] == size(x)[1:nd]  # pad=1 keeps spatial size for kernel 3
+    test_gradients(l, x)
+  end
+end end
+
+@testset ":same padding alias" begin
+  # `:same` computes the exact same padding amounts as `SamePad()`
+  for L in (Conv, ConvTranspose, CrossCor, MaxPool), k in ((3,3), (4,4)), s in (1, 2)
+    args = L in (MaxPool,) ? (k,) : (k, 1=>1)
+    @test L(args...; pad=:same, stride=s).pad == L(args...; pad=SamePad(), stride=s).pad
+  end
+  @test_throws ArgumentError Conv((3,3), 1=>1; pad=:valid)
+end
+
+@testset ":same is adjoint-consistent for even filters (#2431)" begin
+  x = randn(Float32, 8, 8, 1, 1)
+  y = randn(Float32, 16, 16, 1, 1)
+  ww = Float32[0.25, 0.75, 0.75, 0.25] * Float32[0.25, 0.75, 0.75, 0.25]'
+  P = ConvTranspose((4,4), 1=>1; pad=:same, stride=2); P.weight[:,:,1,1] .= ww
+  R = Conv((4,4), 1=>1; pad=:same, stride=2);          R.weight[:,:,1,1] .= ww
+  # extra padding goes on the right/bottom, matching PyTorch/TF
+  @test R.pad == (1, 2, 1, 2)
+  # Conv and ConvTranspose are adjoint: <y, P x> == <x, Rᵀ y>
+  @test sum(y .* P(x)) ≈ sum(x .* R(y)) rtol=1e-4
+  # output is symmetric under reversal
+  Ry = R(ones(Float32, size(y)))
+  @test Ry ≈ reverse(Ry)
+end
+
+@testset "pad_mode validation & show" begin
+  @test_throws ArgumentError Conv((3,3), 1=>1; pad_mode=:bogus)
+  @test_throws ArgumentError Conv((3,3), 1=>1; pad_mode="reflect")
+  @test occursin("pad_mode=:circular", repr(Conv((3,3), 1=>1; pad=1, pad_mode=:circular)))
+  @test !occursin("pad_mode", repr(Conv((3,3), 1=>1; pad=1)))  # default :zeros is hidden
+  @test Flux.f16(Conv((3,3), 1=>1; pad_mode=:reflect)).pad_mode === :reflect  # survives fmap
 end
 
 @testset "Depthwise Conv" begin
@@ -106,19 +227,58 @@ end
 
   m = ConvTranspose((3,3), 1=>1)
   # Test that the gradient call does not throw: #900
-  @test gradient(()->sum(m(x)), params(m)) isa Flux.Zygote.Grads
+  g = gradient(m -> sum(m(x)), m)[1]
 
   x = zeros(Float32, 5, 5, 2, 4)
   m = ConvTranspose((3,3), 2=>3)
-  @test gradient(()->sum(m(x)), params(m)) isa Flux.Zygote.Grads
+  g = gradient(m -> sum(m(x)), m)[1]
+
+  # test ConvTranspose supports groups argument
+  x = randn(Float32, 10, 10, 2, 3)
+  m1 = ConvTranspose((3,3), 2=>4, pad=SamePad())
+  @test size(m1.weight) == (3,3,4,2)
+  @test size(m1(x)) == (10,10,4,3)
+  m2 = ConvTranspose((3,3), 2=>4, groups=2, pad=SamePad())
+  @test size(m2.weight) == (3,3,2,2)
+  @test size(m1(x)) == size(m2(x))
+  g = gradient(m -> sum(m(x)), m2)[1]
+
+  x = randn(Float32, 10, 2,1)
+  m = ConvTranspose((3,), 2=>4, pad=SamePad(), groups=2)
+  @test size(m(x)) === (10,4,1)
+  @test length(m.weight) == (3)*(2*4) / 2
+
+  x = randn(Float32, 10, 11, 4,2)
+  m = ConvTranspose((3,5), 4=>4, pad=SamePad(), groups=4)
+  @test size(m(x)) === (10,11, 4,2)
+  @test length(m.weight) == (3*5)*(4*4)/4
+
+  x = randn(Float32, 10, 11, 12, 3,2)
+  m = ConvTranspose((3,5,3), 3=>6, pad=SamePad(), groups=3)
+  @test size(m(x)) === (10,11, 12, 6,2)
+  @test length(m.weight) == (3*5*3) * (3*6) / 3
+
+  @test occursin("groups=2", sprint(show, ConvTranspose((3,3), 2=>4, groups=2)))
+  @test occursin("2 => 4"  , sprint(show, ConvTranspose((3,3), 2=>4, groups=2)))
+
+  # test ConvTranspose outpad argument for stride > 1
+  x = randn(Float32, 10, 11, 3,2)
+  m1 = ConvTranspose((3,5), 3=>6, stride=3)
+  m2 = ConvTranspose((3,5), 3=>6, stride=3, outpad=(1,0))
+  @test size(m2(x))[1:2] == (size(m1(x))[1:2] .+ (1,0))
+
+  x = randn(Float32, 10, 11, 12, 3,2)
+  m1 = ConvTranspose((3,5,3), 3=>6, stride=3)
+  m2 = ConvTranspose((3,5,3), 3=>6, stride=3, outpad=(1,0,1))
+  @test size(m2(x))[1:3] == (size(m1(x))[1:3] .+ (1,0,1))
 end
 
 @testset "CrossCor" begin
   x = rand(Float32, 28, 28, 1, 1)
-  w = rand(2,2,1,1)
+  w = rand(Float32, 2,2,1,1)
   y = CrossCor(w, [0.0])
 
-  @test isapprox(sum(w .* x[1:2, 1:2, :, :]), y(x)[1, 1, 1, 1], rtol=1e-7)
+  @test sum(w .* x[1:2, 1:2, :, :]) ≈ y(x)[1, 1, 1, 1]  rtol=2e-7
 
   r = zeros(Float32, 28, 28, 1, 5)
   m = Chain(
@@ -131,7 +291,7 @@ end
 
   @test size(m(r)) == (10, 5)
   @test y(x) != Conv(w, [0.0])(x)
-  @test CrossCor(w[end:-1:1, end:-1:1, :, :], [0.0])(x) == Conv(w, [0.0])(x)
+  @test CrossCor(w[end:-1:1, end:-1:1, :, :], [0.0])(x) ≈ Conv(w, [0.0])(x)  rtol=1e-7
 end
 
 @testset "Conv with non quadratic window #700" begin
@@ -160,21 +320,52 @@ end
   end
 end
 
-@testset "$ltype SamePad kernelsize $k" for ltype in (Conv, ConvTranspose, DepthwiseConv, CrossCor), k in ( (1,), (2,), (3,), (4,5), (6,7,8))
+@testset "$ltype $(nd)D symmetric non-constant padding" for ltype in (Conv, ConvTranspose, DepthwiseConv, CrossCor), nd in (1, 2, 3)
+  kernel = ntuple(Returns(3), nd)
+  data = ones(Float32, (kernel .+ 5)..., 1,1)
+
+  pad = ntuple(i -> i, nd)
+  l = ltype(kernel, 1=>1, pad=pad)
+
+  expanded_pad = ntuple(i -> pad[(i - 1) ÷ 2 + 1], 2 * nd)
+  l_expanded = ltype(kernel, 1=>1, pad=expanded_pad)
+
+  @test size(l(data)) == size(l_expanded(data))
+end
+
+@testset "$ltype SamePad kernelsize $k ($(repr(samepad)))" for ltype in (Conv, ConvTranspose, DepthwiseConv, CrossCor), k in ( (1,), (2,), (3,), (4,5), (6,7,8)), samepad in (SamePad(), :same)
   data = ones(Float32, (k .+ 3)..., 1,1)
-  l = ltype(k, 1=>1, pad=SamePad())
+  l = ltype(k, 1=>1, pad=samepad)
   @test size(l(data)) == size(data)
 
-  l = ltype(k, 1=>1, pad=SamePad(), dilation = k .÷ 2)
+  l = ltype(k, 1=>1, pad=samepad, dilation = k .÷ 2)
   @test size(l(data)) == size(data)
 
   stride = 3
-  l = ltype(k, 1=>1, pad=SamePad(), stride = stride)
+  l = ltype(k, 1=>1, pad=samepad, stride = stride)
   if ltype == ConvTranspose
     @test size(l(data))[1:end-2] == stride .* size(data)[1:end-2]
   else
     @test size(l(data))[1:end-2] == cld.(size(data)[1:end-2], stride)
   end
+
+  # https://github.com/FluxML/Flux.jl/issues/2813
+  l = ltype(k, 1=>1, pad=samepad, stride = stride, dilation = 2)
+  if ltype == ConvTranspose
+    @test size(l(data))[1:end-2] == stride .* size(data)[1:end-2]
+  else
+    @test size(l(data))[1:end-2] == cld.(size(data)[1:end-2], stride)
+  end
+end
+
+@testset "ConvTranspose :same with stride and dilation, kernel $k" for k in 1:6, dilation in 1:3, stride in 1:3
+  # https://github.com/FluxML/Flux.jl/issues/2813
+  k_eff = k + (k - 1) * (dilation - 1)
+  k_eff >= stride || continue  # needs negative padding
+  x = rand(Float32, 7, 1, 1)
+  l = ConvTranspose((k,), 1=>1; pad=:same, stride, dilation)
+  @test size(l(x), 1) == 7 * stride
+  @test sum(l.pad) == k_eff - stride
 end
 
 @testset "$ltype SamePad windowsize $k" for ltype in (MeanPool, MaxPool), k in ( (1,), (2,), (3,), (4,5), (6,7,8))
@@ -191,7 +382,7 @@ end
 
 @testset "constructors: $fun" for fun in [Conv, CrossCor, ConvTranspose, DepthwiseConv]
   @test fun(rand(2,3,4)).bias isa Vector{Float64}
-  @test fun(rand(2,3,4,5), false).bias isa Flux.Zeros
+  @test fun(rand(2,3,4,5), false).bias === false
   if fun == Conv
     @test fun(rand(2,3,4,5,6), rand(6)).bias isa Vector{Float64}
     @test_skip fun(rand(2,3,4,5,6), 1:6).bias isa Vector{Float64}
@@ -199,4 +390,19 @@ end
     @test fun(rand(2,3,4,5,6), rand(30)).bias isa Vector{Float64}
   end
   @test_throws DimensionMismatch fun(rand(2,3,4), rand(6))
+end
+
+@testset "type matching" begin
+  x = rand(Float64, 10,2,5)
+  xi = rand(-3:3, 10,2,5)
+  c1 = Conv((3,), 2=>4, relu)
+  @test @inferred(c1(x)) isa Array{Float32, 3}
+  @test c1(xi) isa Array{Float32, 3}
+
+  c2 = CrossCor((3,), 2=>1, relu)
+  @test @inferred(c2(x)) isa Array{Float32, 3}
+
+  c3 = ConvTranspose((3,), 2=>4, relu)
+  @test c3(x) isa Array{Float32, 3}
+  @test (@inferred c3(x); true)
 end

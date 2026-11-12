@@ -5,5 +5,13 @@
 docs/build/
 docs/site/
 deps
-.vscode
-Manifest.toml
+Manifest*toml
+LocalPreferences.toml
+.DS_Store
+docs/mymodel.bson
+prova.jl
+REVIEW.md
+.CondaPkg/
+uv.lock
+.venv/
+__pycache__/

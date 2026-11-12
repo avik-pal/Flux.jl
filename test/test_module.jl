@@ -1,0 +1,208 @@
+using BSON: BSON
+using FiniteDifferences: FiniteDifferences
+using Flux
+using Flux: OneHotArray, OneHotMatrix, OneHotVector,
+            onehot, onehotbatch, withgradient, pullback, outputsize, attention_with_weights
+using Flux.Losses: xlogx, xlogy
+using Flux.Losses
+using Flux: gradient, withgradient # explicit import to avoid ambiguity with Zygote and Enzyme
+using ForwardDiff: ForwardDiff
+using Functors: Functors, fmapstructure_with_path, fmap
+using IterTools: ncycle
+using LinearAlgebra
+using Mooncake: Mooncake
+using MLUtils: MLUtils, batch, unstack, unsqueeze, 
+              unbatch, getobs, numobs, flatten, DataLoader
+using Optimisers: Optimisers
+using Pkg
+using Random
+using SparseArrays
+using Statistics
+using Test
+using Zygote: Zygote
+
+# While Mooncake ships its own copy of the rules for Flux functions, Flux's extension does not
+# load its own (see `ext/FluxMooncakeExt`). Swap them in, so that the copy under test is Flux's.
+# Mooncake's are deleted first: a rule missing from ours must not fall back to it.
+let ours = Base.get_extension(Flux, :FluxMooncakeExt),
+    theirs = Base.get_extension(Mooncake, :MooncakeFluxExt)
+
+    # A worker loads this file once per test file it runs, and must swap only once.
+    if theirs !== nothing && !isempty(methods(Mooncake.rrule!!, theirs))
+        for f in (Mooncake.rrule!!, Mooncake._is_primitive)
+            foreach(Base.delete_method, methods(f, theirs))
+        end
+        Base.include(ours, joinpath(pkgdir(Flux), "ext", "FluxMooncakeExt", "rules.jl"))
+    end
+end
+
+
+for pkg in [:CUDA, :AMDGPU, :Metal, :Enzyme, :Reactant, :MPI, :NCCL]
+    if Base.find_package(string(pkg)) !== nothing
+        @eval using $pkg
+    end
+end
+
+if Base.find_package("Reactant") !== nothing
+    include("ext_reactant/test_utils_reactant.jl")
+end
+
+# group here all losses, used in tests
+const ALL_LOSSES = [Flux.Losses.mse, Flux.Losses.mae, Flux.Losses.msle,
+                    Flux.Losses.crossentropy, Flux.Losses.logitcrossentropy,
+                    Flux.Losses.binarycrossentropy, Flux.Losses.logitbinarycrossentropy,
+                    Flux.Losses.kldivergence,
+                    Flux.Losses.huber_loss,
+                    Flux.Losses.tversky_loss,
+                    Flux.Losses.dice_coeff_loss,
+                    Flux.Losses.poisson_loss,
+                    Flux.Losses.hinge_loss, Flux.Losses.squared_hinge_loss,
+                    Flux.Losses.binary_focal_loss, Flux.Losses.focal_loss,
+                    Flux.Losses.siamese_contrastive_loss]
+
+
+const TEST_MODELS = [
+    (Dense(2=>4), randn(Float32, 2), "Dense"),
+    (Chain(Dense(2=>4, tanh), Dense(4=>3)), randn(Float32, 2), "Chain(Dense, Dense)"),
+    (f64(Chain(Dense(2=>4), Dense(4=>2))), randn(Float64, 2, 1), "f64(Chain(Dense, Dense))"),
+    (Flux.Scale([1.0f0 2.0f0 3.0f0 4.0f0], true, abs2), randn(Float32, 2), "Flux.Scale"),
+    (Conv((3, 3), 2 => 3), randn(Float32, 3, 3, 2, 1), "Conv"),
+    (Chain(Conv((3, 3), 2 => 3, ), Conv((3, 3), 3 => 1, tanh)), rand(Float32, 5, 5, 2, 1), "Chain(Conv, Conv)"),
+    (Chain(Conv((4, 4), 2 => 2, pad=SamePad()), MeanPool((5, 5), pad=SamePad())), rand(Float32, 5, 5, 2, 2), "Chain(Conv, MeanPool)"),
+    (Maxout(() -> Dense(5 => 4, tanh), 3), randn(Float32, 5, 1), "Maxout"),
+    (SkipConnection(Dense(2 => 2), vcat), randn(Float32, 2, 3), "SkipConnection"),
+    (Flux.Bilinear((2, 2) => 3), randn(Float32, 2, 1), "Bilinear"),
+    (ConvTranspose((3, 3), 3 => 2, stride=2), rand(Float32, 5, 5, 3, 1), "ConvTranspose"),
+    (LayerNorm(2), randn(Float32, 2, 10), "LayerNorm"),
+    (BatchNorm(2), randn(Float32, 2, 10), "BatchNorm"),
+    (Attention(16), randn32(16, 20, 2), "Attention"),
+    (RNN(3 => 2), randn(Float32, 3, 2), "RNN"), 
+    (LSTM(3 => 5), randn(Float32, 3, 2), "LSTM"),
+    (GRU(3 => 5), randn(Float32, 3, 10), "GRU"),
+    (Chain(RNN(3 => 4), RNN(4 => 3)), randn(Float32, 3, 2), "Chain(RNN, RNN)"),
+    (Chain(LSTM(3 => 5), LSTM(5 => 3)), randn(Float32, 3, 2), "Chain(LSTM, LSTM)"),
+]
+
+function _contains_no_numerical(kp, x)
+    count = 0
+    fmap(x) do y
+        if y isa AbstractArray{<:AbstractFloat}
+            count += 1
+        end
+        return y
+    end
+    return count == 0
+end
+
+function check_equal_leaves(a, b; rtol=1e-4, atol=1e-4)
+    # Recurse until we hit a genuine leaf (where we compare the arrays) or a
+    # subtree containing no numerical arrays. The latter is pruned because a
+    # backend can return `nothing` for an entire subtree, and we must not recurse
+    # into it.
+    exclude(kp, x) = Functors.isleaf(x) || _contains_no_numerical(kp, x)
+    fmapstructure_with_path(a, b; exclude) do kp, x, y
+        # @show kp
+        # Compare only where both backends produced a numerical gradient. A `nothing`
+        # on either side marks a leaf that backend did not differentiate (e.g. the
+        # non-trainable running stats of a normalisation layer), which we skip.
+        if x isa AbstractArray{<:AbstractFloat} && y isa AbstractArray{<:AbstractFloat}
+            @test x ≈ y rtol=rtol atol=atol
+        end
+    end
+    return true
+end
+
+_default_fdm() = FiniteDifferences.central_fdm(5, 1, max_range=1e-2)
+
+# Enzyme is compared by default only when the Enzyme tests are enabled.
+_default_compare() = FLUX_TEST_ENZYME ? [AutoZygote(), AutoEnzyme()] : [AutoZygote()]
+
+"""
+Compare the `reference` AD backend with the `compare` AD backends on the gradients of `f` at `xs...`.
+The loss function can be customized (default is mean over outputs).
+
+`compare` can be a single AD backend or a list of them. It defaults to Zygote and,
+unless `FLUX_TEST_ENZYME` is false, Enzyme. With `compare=nothing` the `reference` backend is used.
+
+- If `test_gpu` is true, the `compare` backends are tested on GPU.
+- If `test_cpu` is true, the `compare` backends are tested on CPU.
+- If `test_reactant` is true, the Enzyme backend is tested with Reactant.
+  Depending on the platform, this may run on CPU or GPU.
+"""
+function test_gradients(
+            f, 
+            xs...;
+            rtol=1e-4, atol=1e-4,
+            test_gpu = false,
+            test_cpu = true,
+            test_reactant = false,
+            reference = AutoFiniteDifferences(; fdm = _default_fdm()),
+            compare = _default_compare(),
+            loss = (f, xs...) -> mean(f(xs...)),
+            test_mode = false,
+            )
+
+    @assert reference !== nothing "reference AD backend must be provided"
+    @assert compare !== nothing || test_gpu "compare AD backend must be provided if test_gpu=false"
+    compare = compare === nothing ? reference : compare
+    backends = compare isa Union{Tuple, AbstractVector} ? compare : (compare,)
+
+    if test_mode
+        Flux.testmode!(f)
+    else
+        Flux.trainmode!(f)
+    end
+
+    cpu_dev = cpu_device()
+    
+    if test_gpu
+        gpu_dev = gpu_device(force=true)
+        cpu_dev = cpu_device()
+        xs_gpu = xs |> gpu_dev
+        f_gpu = f |> gpu_dev
+    end
+    
+    if test_reactant
+        reactant_dev = MLDataDevices.reactant_device(force=true)
+        xs_re = xs |> reactant_dev
+        f_re = f |> reactant_dev
+    end
+
+    ## Let's make sure first that the forward pass works.
+    l = loss(f, xs...)
+    @test l isa Number
+
+    # Compute reference gradients in f64 precision
+    y, gs = Flux.withgradient(loss, reference, Flux.f64(f), Flux.f64(xs)...)
+    @test l ≈ y rtol=rtol atol=atol
+
+    if test_cpu
+        for backend in backends
+            y2, gs2 = Flux.withgradient(loss, backend, f, xs...)
+            @test l ≈ y2 rtol=rtol atol=atol
+            check_equal_leaves(gs, gs2; rtol, atol)
+        end
+    end
+
+    if test_gpu
+        l_gpu = loss(f_gpu, xs_gpu...)
+        @test l_gpu isa Number
+
+        for backend in backends
+            y_gpu, gs_gpu = Flux.withgradient(loss, backend, f_gpu, xs_gpu...)
+            @test l_gpu ≈ y_gpu rtol=rtol atol=atol
+            check_equal_leaves(gs, gs_gpu |> cpu_dev; rtol, atol)
+        end
+    end
+
+    if test_reactant
+        l_re = reactant_loss(loss, f_re, xs_re...)
+        @test l ≈ l_re rtol=rtol atol=atol
+
+        y_re, g_re = reactant_withgradient(loss, f_re, xs_re...)
+        @test y ≈ y_re rtol=rtol atol=atol
+        check_equal_leaves(gs, g_re |> cpu_dev; rtol, atol)
+    end
+
+    return true
+end

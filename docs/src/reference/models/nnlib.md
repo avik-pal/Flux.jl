@@ -1,0 +1,156 @@
+```@meta
+CollapsedDocStrings = true
+```
+
+# Neural Network primitives from NNlib.jl
+
+Flux re-exports all of the functions exported by the [NNlib](https://github.com/FluxML/NNlib.jl) package. This includes activation functions, described on [their own page](@ref man-activations). Many of the functions on this page exist primarily as the internal implementation of Flux layer, but can also be used independently.
+
+
+## Attention
+
+Primitives for the [`Attention`](@ref) layer.
+
+```@docs
+NNlib.scaled_dot_product_attention
+NNlib.scaled_dot_product_attention_with_weights
+NNlib.is_fused_attention
+NNlib.make_causal_mask
+```
+
+## Softmax
+
+`Flux`'s [`Flux.logitcrossentropy`](@ref) uses [`NNlib.logsoftmax`](@ref) internally.
+
+```@docs
+softmax
+softmax!
+logsoftmax
+logsoftmax!
+```
+
+## Pooling
+
+`Flux`'s [`AdaptiveMaxPool`](@ref), [`AdaptiveMeanPool`](@ref), [`GlobalMaxPool`](@ref), [`GlobalMeanPool`](@ref), 
+[`MaxPool`](@ref), and [`MeanPool`](@ref) use [`NNlib.PoolDims`](@ref), [`NNlib.maxpool`](@ref), and [`NNlib.meanpool`](@ref) as their backend.
+
+```@docs
+NNlib.PoolDims
+NNlib.lpnormpool
+NNlib.maxpool
+NNlib.meanpool
+```
+
+## Padding
+
+```@docs
+NNlib.pad_circular
+NNlib.pad_constant
+NNlib.pad_reflect
+NNlib.pad_repeat
+NNlib.pad_symmetric
+NNlib.pad_zeros
+```
+
+## Convolution
+
+`Flux`'s [`Conv`](@ref) and [`CrossCor`](@ref) layers use [`NNlib.DenseConvDims`](@ref) and [`NNlib.conv`](@ref) internally. 
+
+```@docs
+conv
+ConvDims
+depthwiseconv
+DepthwiseConvDims
+DenseConvDims
+NNlib.unfold
+NNlib.fold
+```
+
+## Dropout
+
+```@docs
+NNlib.dropout
+NNlib.dropout!
+```
+
+## Normalization
+
+`Flux`'s [`BatchNorm`](@ref), [`InstanceNorm`](@ref), [`GroupNorm`](@ref), and [`LayerNorm`](@ref) layers wrap the functional normalization operators below as their backend.
+
+```@docs
+NNlib.normalise
+NNlib.batchnorm
+NNlib.instancenorm
+NNlib.groupnorm
+NNlib.layernorm
+NNlib.rmsnorm
+```
+
+## Upsampling
+
+`Flux`'s [`Upsample`](@ref) layer uses [`NNlib.upsample_nearest`](@ref), [`NNlib.upsample_bilinear`](@ref), and [`NNlib.upsample_trilinear`](@ref) as its backend. Additionally, `Flux`'s [`PixelShuffle`](@ref) layer uses [`NNlib.pixel_shuffle`](@ref) as its backend.
+
+```@docs
+upsample_nearest
+upsample_linear
+upsample_bilinear
+upsample_trilinear
+pixel_shuffle
+```
+
+## Rotation
+
+```@docs
+imrotate
+```
+
+## Batched Operations
+
+`Flux`'s [`Flux.Bilinear`](@ref) layer uses [`NNlib.batched_mul`](@ref) internally.
+
+```@docs
+batched_mul
+batched_mul!
+batched_adjoint
+batched_transpose
+batched_vec
+```
+
+## Gather and Scatter
+
+`Flux`'s [`Embedding`](@ref) layer uses [`NNlib.gather`](@ref) as its backend.
+
+```@docs
+NNlib.gather
+NNlib.gather!
+NNlib.scatter
+NNlib.scatter!
+```
+
+## Sampling
+
+```@docs
+grid_sample
+```
+
+## Audio
+
+The spectral functions require the [FFTW](https://github.com/JuliaMath/FFTW.jl) package to be loaded.
+
+```@docs
+hann_window
+hamming_window
+stft
+istft
+spectrogram
+melscale_filterbanks
+```
+
+## Miscellaneous
+
+```@docs
+NNlib.logsumexp
+NNlib.NNlib.glu
+NNlib.NNlib.within_gradient
+NNlib.bias_act!
+```

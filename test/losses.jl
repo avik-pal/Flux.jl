@@ -1,21 +1,3 @@
-using Test
-using Flux: onehotbatch, σ
-
-using Flux.Losses: mse, label_smoothing, crossentropy, logitcrossentropy, binarycrossentropy, logitbinarycrossentropy
-using Flux.Losses: xlogx, xlogy
-
-# group here all losses, used in tests
-const ALL_LOSSES = [Flux.Losses.mse, Flux.Losses.mae, Flux.Losses.msle,
-                    Flux.Losses.crossentropy, Flux.Losses.logitcrossentropy,
-                    Flux.Losses.binarycrossentropy, Flux.Losses.logitbinarycrossentropy,
-                    Flux.Losses.kldivergence,
-                    Flux.Losses.huber_loss,
-                    Flux.Losses.tversky_loss,
-                    Flux.Losses.dice_coeff_loss,
-                    Flux.Losses.poisson_loss,
-                    Flux.Losses.hinge_loss, Flux.Losses.squared_hinge_loss,
-                    Flux.Losses.binary_focal_loss, Flux.Losses.focal_loss]
-
 
 @testset "xlogx & xlogy" begin
   @test iszero(xlogx(0))
@@ -31,6 +13,14 @@ const ALL_LOSSES = [Flux.Losses.mse, Flux.Losses.mae, Flux.Losses.msle,
   @test xlogy(2, 3) ≈ 2.0 * log(3.0)
   @inferred xlogy(2, 3)
   @inferred xlogy(0, 1)
+
+  # https://github.com/FluxML/Flux.jl/issues/2762
+  @test Zygote.gradient(xlogx, 2.0)[1] ≈ log(2.0) + 1
+  x = [0.5, 2.0]
+  @test Zygote.gradient(x -> sum(xlogx, x), x)[1] ≈ log.(x) .+ 1
+  @test Zygote.gradient(x -> sum(map(xlogx, x)), x)[1] ≈ log.(x) .+ 1
+  @test Zygote.gradient(x -> sum(xlogx.(x)), x)[1] ≈ log.(x) .+ 1
+  @test Zygote.gradient(xlogy, 2.0, 3.0) == (log(3.0), 2.0 / 3.0)
 end
 
 # First, regression-style y's
@@ -39,6 +29,9 @@ y = [1, 1, 0, 0]
 
 @testset "mse" begin
   @test mse(ŷ, y) ≈ (.1^2 + .9^2)/2
+
+  # Test that mse() loss works on complex values:
+  @test mse(0 + 0im, 1 + 1im) == 2
 end
 
 @testset "mae" begin
@@ -85,8 +78,8 @@ y_dis[1,:], y_dis[2,:] = y_dis[2,:], y_dis[1,:]
   @test crossentropy(ŷ, y_smoothed) ≈ lossvalue_smoothed
   @test crossentropy(ylp, label_smoothing(yl, 2sf)) ≈ -sum(yls.*log.(ylp))
   @test crossentropy(ylp, yl) ≈ -sum(yl.*log.(ylp))
-  @test iszero(crossentropy(y_same, ya, ϵ=0))
-  @test iszero(crossentropy(ya, ya, ϵ=0))
+  @test iszero(crossentropy(y_same, ya, eps=0))
+  @test iszero(crossentropy(ya, ya, eps=0))
   @test crossentropy(y_sim, ya) < crossentropy(y_sim, ya_smoothed)
   @test crossentropy(y_dis, ya) > crossentropy(y_dis, ya_smoothed)
 end
@@ -97,18 +90,99 @@ end
   @test logitcrossentropy(logylp, label_smoothing(yl, 2sf)) ≈ -sum(yls.*logsoftmax(logylp))
 end
 
+# Dense one-hot encoding of the class labels `y` along `dims`, for comparison.
+function onehot_along(y, C, dims)
+  yhot = zeros(Bool, size(y)[1:dims-1]..., C, size(y)[dims:end]...)
+  for I in CartesianIndices(y)
+    t = Tuple(I)
+    yhot[t[1:dims-1]..., y[I], t[dims:end]...] = true
+  end
+  return yhot
+end
+
+@testset "crossentropy with class labels" begin
+  C = 4
+  @testset "size $sz, dims = $dims" for (sz, dims) in (((C, 5), 1), ((C, 2, 3), 1), ((3, C, 5), 2), ((3, 5, C), 3))
+    ŷ = randn(sz...)
+    p = softmax(ŷ; dims)
+    y = rand(1:C, sz[setdiff(1:length(sz), dims)])
+    yhot = onehot_along(y, C, dims)
+    for (loss, x) in ((logitcrossentropy, ŷ), (crossentropy, p))
+      @test loss(x, y; dims) ≈ loss(x, yhot; dims)
+      l = loss(x, y; dims, agg = identity)
+      @test size(l) == size(y)
+      @test l ≈ dropdims(loss(x, yhot; dims, agg = identity); dims)
+      @test gradient(x -> loss(x, y; dims), x)[1] ≈ gradient(x -> loss(x, yhot; dims), x)[1]
+      agg = l -> sum(abs2, l)
+      @test gradient(x -> loss(x, y; dims, agg), x)[1] ≈ gradient(x -> loss(x, yhot; dims, agg), x)[1]
+    end
+  end
+
+  @testset "label types" begin
+    ŷ = randn(C, 5)
+    y = rand(1:C, 5)
+    yhot = onehot_along(y, C, 1)
+    @test logitcrossentropy(ŷ, Int32.(y)) ≈ logitcrossentropy(ŷ, yhot)
+    @test logitcrossentropy(ŷ, y; agg = sum) ≈ logitcrossentropy(ŷ, yhot; agg = sum)
+    # an integer `y` of the size of `ŷ` is still a dense target, not labels
+    @test logitcrossentropy(ŷ, Int.(yhot)) ≈ logitcrossentropy(ŷ, yhot)
+  end
+
+  @testset "single sample" begin
+    ŷ = randn(C)
+    @test logitcrossentropy(ŷ, fill(2)) ≈ logitcrossentropy(ŷ, onehot(2, 1:C))
+    @test crossentropy(softmax(ŷ), fill(2)) ≈ crossentropy(softmax(ŷ), onehot(2, 1:C))
+    for (loss, x) in ((logitcrossentropy, ŷ), (crossentropy, softmax(ŷ)))
+      @test gradient(x -> loss(x, fill(2)), x)[1] ≈ gradient(x -> loss(x, onehot(2, 1:C)), x)[1]
+      @test gradient(x -> loss(x, fill(2); agg = sum), x)[1] ≈ gradient(x -> loss(x, onehot(2, 1:C); agg = sum), x)[1]
+    end
+  end
+
+  @testset "OneHotArray" begin
+    for sz in ((C, 5), (C, 5, 2))
+      ŷ = randn(sz...)
+      p = softmax(ŷ)
+      y = onehotbatch(rand(1:C, sz[2:end]), 1:C)
+      for (loss, x) in ((logitcrossentropy, ŷ), (crossentropy, p))
+        @test loss(x, y) ≈ loss(x, Array(y))
+        # keeps the size of the dense loss, with a leading singleton dimension
+        @test loss(x, y; agg = identity) ≈ loss(x, Array(y); agg = identity)
+        @test size(loss(x, y; agg = identity)) == (1, sz[2:end]...)
+        if length(sz) == 2
+          @test gradient(x -> loss(x, y), x)[1] ≈ gradient(x -> loss(x, Array(y)), x)[1]
+        end
+      end
+    end
+    @test_throws DimensionMismatch logitcrossentropy(randn(C + 1, 5), onehotbatch(rand(1:C, 5), 1:C))
+  end
+
+  @testset "errors" begin
+    ŷ = randn(C, 5)
+    y = rand(1:C, 5)
+    for loss in (logitcrossentropy, crossentropy)
+      @test_throws ArgumentError loss(ŷ, [0; y[2:end]])
+      @test_throws ArgumentError loss(ŷ, [y[1:end-1]; C + 1])
+      @test_throws DimensionMismatch loss(ŷ, y[1:end-1])
+      @test_throws DimensionMismatch loss(ŷ, y; dims = 2)
+      @test_throws ArgumentError loss(ŷ, y; dims = 3)
+      @test_throws DimensionMismatch loss(ŷ, reshape(y, 1, :))
+    end
+  end
+end
+
 logŷ, y = randn(3), rand(3)
 yls = y.*(1-2sf).+sf
 
 @testset "binarycrossentropy" begin
-  @test binarycrossentropy.(σ.(logŷ), label_smoothing(y, 2sf; dims=0); ϵ=0) ≈ -yls.*log.(σ.(logŷ)) - (1 .- yls).*log.(1 .- σ.(logŷ))
-  @test binarycrossentropy(σ.(logŷ), y; ϵ=0) ≈ mean(-y.*log.(σ.(logŷ)) - (1 .- y).*log.(1 .- σ.(logŷ)))
+  @test binarycrossentropy.(σ.(logŷ), label_smoothing(y, 2sf; dims=0); eps=0) ≈ -yls.*log.(σ.(logŷ)) - (1 .- yls).*log.(1 .- σ.(logŷ))
+  @test binarycrossentropy(σ.(logŷ), y; eps=0) ≈ mean(-y.*log.(σ.(logŷ)) - (1 .- y).*log.(1 .- σ.(logŷ)))
   @test binarycrossentropy(σ.(logŷ), y) ≈ mean(-y.*log.(σ.(logŷ) .+ eps.(σ.(logŷ))) - (1 .- y).*log.(1 .- σ.(logŷ) .+ eps.(σ.(logŷ))))
+  @test binarycrossentropy([0.1,0.2,0.9], 1) ≈ -mean(log, [0.1,0.2,0.9])  # constant label
 end
 
 @testset "logitbinarycrossentropy" begin
-  @test logitbinarycrossentropy.(logŷ, label_smoothing(y, 0.2)) ≈ binarycrossentropy.(σ.(logŷ), label_smoothing(y, 0.2); ϵ=0)
-  @test logitbinarycrossentropy(logŷ, y) ≈ binarycrossentropy(σ.(logŷ), y; ϵ=0)
+  @test logitbinarycrossentropy.(logŷ, label_smoothing(y, 0.2)) ≈ binarycrossentropy.(σ.(logŷ), label_smoothing(y, 0.2); eps=0)
+  @test logitbinarycrossentropy(logŷ, y) ≈ binarycrossentropy(σ.(logŷ), y; eps=0)
 end
 
 y = onehotbatch([1], 0:1)
@@ -160,8 +234,10 @@ end
 
 @testset "tversky_loss" begin
   @test Flux.tversky_loss(ŷ, y) ≈ -0.06772009029345383
-  @test Flux.tversky_loss(ŷ, y, β=0.8) ≈ -0.09490740740740744
+  @test Flux.tversky_loss(ŷ, y, beta=0.8) ≈ -0.09490740740740744
   @test Flux.tversky_loss(y, y) ≈ -0.5576923076923075
+  # the old Greek keyword `β` is not accepted, rather than silently ignored
+  @test_throws MethodError Flux.tversky_loss(ŷ, y; β=0.8)
 end
 
 @testset "no spurious promotions" begin
@@ -173,6 +249,43 @@ end
       @test fwd isa T
       @test eltype(back(one(T))[1]) == T
     end
+  end
+end
+
+@testset "Float16 and BFloat16 inputs are computed in Float32" begin
+  ŷ32 = 0.1f0 .+ 0.8f0 .* rand(Float32, 3, 4)
+  y32 = 0.1f0 .+ 0.8f0 .* rand(Float32, 3, 4)
+  @testset "$T, $f" for (T, lowprec) in ((Float16, f16), (BFloat16, bf16)), f in ALL_LOSSES
+    ŷ, y = lowprec(ŷ32), lowprec(y32)
+    l, (dŷ, dy) = withgradient(f, ŷ, y)
+    l32, (dŷ32, dy32) = withgradient(f, Float32.(ŷ), Float32.(y))
+    @test l isa Float32
+    @test l ≈ l32
+    @test eltype(dŷ) == eltype(dy) == T
+    @test dŷ ≈ lowprec(dŷ32)
+    @test dy ≈ lowprec(dy32)
+  end
+
+  @testset "sums don't stall" begin
+    x = randn(Float32, 100, 4096)
+    labels = rand(1:100, 4096)
+    for lowprec in (f16, bf16)
+      x16 = lowprec(x)
+      @test logitcrossentropy(x16, labels) ≈ logitcrossentropy(Float32.(x16), labels)
+      @test logitcrossentropy(x16, onehotbatch(labels, 1:100)) ≈ logitcrossentropy(Float32.(x16), labels)
+      @test crossentropy(softmax(x16), labels) ≈ crossentropy(Float32.(softmax(x16)), labels)
+      g = gradient(x -> logitcrossentropy(x, labels), x16)[1]
+      @test g isa Matrix{eltype(x16)}
+      @test g ≈ lowprec(gradient(x -> logitcrossentropy(x, labels), Float32.(x16))[1])
+    end
+    @test mse(fill(Float16(300), 10), zeros(Float16, 10)) == 90000
+  end
+
+  @testset "$T model keeps $T gradients" for (T, lowprec) in ((Float16, f16), (BFloat16, bf16))
+    m = lowprec(Dense(3 => 4))
+    x = lowprec(rand(Float32, 3, 5))
+    g = gradient(m -> logitcrossentropy(m(x), rand(1:4, 5)), m)[1]
+    @test eltype(g.weight) == eltype(g.bias) == T
   end
 end
 
@@ -188,7 +301,24 @@ end
           0.4 0.7]
     @test Flux.binary_focal_loss(ŷ, y) ≈ 0.0728675615927385
     @test Flux.binary_focal_loss(ŷ1, y1) ≈ 0.05691642237852222
-    @test Flux.binary_focal_loss(ŷ, y; γ=0.0) ≈ Flux.binarycrossentropy(ŷ, y)
+    @test Flux.binary_focal_loss(ŷ, y; gamma=0.0) ≈ Flux.binarycrossentropy(ŷ, y)
+
+    # predictions of exactly 0 or 1, e.g. from a saturated sigmoid (#2818)
+    ŷ2 = sigmoid.(Float32[20, -20, -3])
+    y2 = [0, 1, 1]
+    @test ŷ2[1] == 1 && ŷ2[2] < eps(Float32)
+    @test isfinite(Flux.binary_focal_loss(ŷ2, y2))
+    @test Flux.binary_focal_loss(ŷ2, y2; gamma=0) ≈ Flux.binarycrossentropy(ŷ2, y2)
+    @test Flux.binary_focal_loss([1.0, 0.0], [0, 1]; gamma=0) ≈ Flux.binarycrossentropy([1.0, 0.0], [0, 1])
+    @test all(isfinite, gradient(ŷ -> Flux.binary_focal_loss(ŷ, y2), ŷ2)[1])
+    # A non-integer gamma is well-defined for a saturated, correct prediction when gamma > 1.
+    ŷsat = Float32[1, 0]
+    ysat = Float32[1, 0]
+    loss_sat = Flux.binary_focal_loss(ŷsat, ysat; gamma=1.5)
+    grad_sat = gradient(ŷ -> Flux.binary_focal_loss(ŷ, ysat; gamma=1.5), ŷsat)[1]
+    @test isfinite(loss_sat) && isapprox(loss_sat, 0; atol=eps(Float32))
+    @test all(isfinite, grad_sat) && all(iszero, grad_sat)
+
 end
 
 @testset "focal_loss" begin
@@ -204,5 +334,46 @@ end
           0.1 0.3]
     @test Flux.focal_loss(ŷ, y) ≈ 1.1277571935622628
     @test Flux.focal_loss(ŷ1, y1) ≈ 0.45990566879720157
-    @test Flux.focal_loss(ŷ, y; γ=0.0) ≈ Flux.crossentropy(ŷ, y)
+    @test Flux.focal_loss(ŷ, y; gamma=0) ≈ Flux.crossentropy(ŷ, y)
+    # the old Greek keywords `γ`, `ϵ` are not accepted, rather than silently ignored
+    @test_throws MethodError Flux.focal_loss(ŷ, y; γ=0)
+    @test_throws MethodError Flux.focal_loss(ŷ, y; ϵ=0.1)
+end
+  
+@testset "siamese_contrastive_loss" begin
+  y = [1 0
+       0 0
+       0 1]
+  ŷ = [0.4 0.2
+       0.5 0.5
+       0.1 0.3]
+  y1 = [1 0 0 0 1
+        0 1 0 1 0
+        0 0 1 0 0]
+  ŷ1 = softmax(reshape(-7:7, 3, 5) .* 1.0f0)
+  y2 = [1
+        0
+        0
+        1
+        1]
+  ŷ2 = [0.6
+        0.4
+        0.1
+        0.2
+        0.7]
+  @test Flux.siamese_contrastive_loss(ŷ, y) ≈ 0.2333333333333333
+  @test Flux.siamese_contrastive_loss(ŷ, y, margin = 0.5f0) ≈ 0.10000000000000002
+  @test Flux.siamese_contrastive_loss(ŷ, y, margin = 1.5f0) ≈ 0.5333333333333333
+  @test Flux.siamese_contrastive_loss(ŷ1, y1) ≈ 0.32554644f0
+  @test Flux.siamese_contrastive_loss(ŷ1, y1, margin = 0.5f0) ≈ 0.16271012f0
+  @test Flux.siamese_contrastive_loss(ŷ1, y1, margin = 1.5f0) ≈ 0.6532292f0
+  @test Flux.siamese_contrastive_loss(ŷ, y, margin = 1) ≈ Flux.siamese_contrastive_loss(ŷ, y)
+  @test Flux.siamese_contrastive_loss(y, y) ≈ 0.0
+  @test Flux.siamese_contrastive_loss(y1, y1) ≈ 0.0
+  @test Flux.siamese_contrastive_loss(ŷ, y, margin = 0) ≈ 0.09166666666666667
+  @test Flux.siamese_contrastive_loss(ŷ1, y1, margin = 0) ≈ 0.13161165f0
+  @test Flux.siamese_contrastive_loss(ŷ2, y2) ≈ 0.21200000000000005
+  @test Flux.siamese_contrastive_loss(ŷ2, ŷ2) ≈ 0.18800000000000003
+  @test_throws DomainError(-0.5, "Margin must be non-negative") Flux.siamese_contrastive_loss(ŷ1, y1, margin = -0.5)
+  @test_throws DomainError(-1, "Margin must be non-negative") Flux.siamese_contrastive_loss(ŷ, y, margin = -1)
 end

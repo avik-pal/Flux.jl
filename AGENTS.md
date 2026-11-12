@@ -1,0 +1,119 @@
+# AI Agent Context
+
+This file provides guidance to all AI code assistants when working with code in this repository.
+
+## Changelog (NEWS.md)
+
+Do **not** edit [NEWS.md](NEWS.md) in regular PRs: entries in concurrent PRs conflict with each other as they get merged. Updating it is a maintenance job done right before tagging a release, from the PRs merged since the previous one.
+
+- When preparing a release, add the entries under the `## Unreleased` heading at the top of the file, then rename that heading to `## vX.Y.Z (D Month YYYY)` and open a fresh, empty `## Unreleased` section above it.
+- Use one `-` bullet per change, written from the user's perspective (what changed and why it matters), with a link to the PR or issue, e.g. `([#2665](https://github.com/FluxML/Flux.jl/pull/2665))`.
+- Flag breaking changes explicitly with a bold **breaking change** note.
+- Record only notable, user-facing changes. Skip CI tweaks, dependency bumps, formatting, and internal refactors.
+
+## Commands
+
+**Run all CPU tests:**
+```
+# List all available tests
+julia --project=test/ test/runtests.jl --list
+
+# Run with verbose output and 4 workers
+julia --project=test/ test/runtests.jl --verbose --jobs=4
+
+# Run with quick-fail enabled
+julia --project=test/ test/runtests.jl --quickfail
+```
+
+**Run a single test file:**
+```
+julia --project=test/ test/runtests.jl layers/conv
+```
+
+**Run tests with specific backends:**
+```
+FLUX_TEST_CUDA=true julia --project=test/ test/runtests.jl
+FLUX_TEST_ENZYME=false julia --project=test/ test/runtests.jl
+FLUX_TEST_REACTANT=false julia --project=test/ test/runtests.jl
+```
+
+Test environment flags: `FLUX_TEST_CPU` (default true), `FLUX_TEST_CUDA`, `FLUX_TEST_AMDGPU`, `FLUX_TEST_METAL`, `FLUX_TEST_ENZYME` (default true), `FLUX_TEST_REACTANT` (default true), `FLUX_TEST_REACTANT_CUDA` (fail unless Reactant runs on XLA's CUDA backend), `FLUX_TEST_DISTRIBUTED_MPI`, `FLUX_TEST_DISTRIBUTED_NCCL`.
+
+## Architecture
+
+Flux.jl is a pure-Julia ML framework. The main entry point is [src/Flux.jl](src/Flux.jl), which re-exports from several key dependencies.
+
+### Core Design
+
+**Gradient computation** ([src/gradient.jl](src/gradient.jl)): `Flux.gradient` and `Flux.withgradient` are thin wrappers that default to Zygote, but dispatch to Enzyme when `Duplicated` arguments are detected. Other backends (Mooncake, FiniteDifferences) are specified via `ADTypes` (`AutoMooncake()` etc.) and loaded via package extensions.
+
+**Training API** ([src/train.jl](src/train.jl)): `Flux.setup(rule, model)` wraps `Optimisers.setup` with mutability checks. `Flux.train!(loss, model, data, opt_state)` iterates over data calling gradients and `Optimisers.update!`. Models are mutated in-place.
+
+**Layer definition** ([src/layers/macro.jl](src/layers/macro.jl)): The `@layer` macro is the standard way to declare a custom layer. It calls `Functors.@functor` (so `fmap` traverses parameters) and sets up pretty-printing.
+
+**Functor integration** ([src/functor.jl](src/functor.jl)): `fmap` from Functors.jl is used to move models between devices (`gpu`, `cpu`) and change precision (`f32`, `f64`, `f16`). The `trainable` function (from Optimisers.jl) controls which parameters are updated.
+
+### Key Dependencies (re-exported to users)
+
+- **NNlib** — low-level primitives: `conv`, `relu`, `softmax`, pooling, etc.
+- **Optimisers.jl** — optimizer rules (`Adam`, `SGD`, etc.) and `destructure`
+- **Zygote.jl** — default AD engine; `pullback`, `jacobian`, `hessian` re-exported
+- **MLDataDevices.jl** — device abstraction (`gpu_device()`, `cpu_device()`, `CUDADevice`, etc.)
+- **ADTypes.jl** — `AutoZygote`, `AutoEnzyme`, `AutoMooncake`, `AutoFiniteDifferences`
+- **Functors.jl** — `fmap`, `fmapstructure` for model traversal
+- **OneHotArrays.jl** — `onehot`, `onehotbatch`, `onecold`
+
+### Source Layout
+
+```
+src/
+├── gradient.jl       # Flux.gradient / withgradient with multi-backend dispatch
+├── train.jl          # Flux.setup, Flux.train! (Train submodule)
+├── functor.jl        # fmap-based device movement, @functor helpers
+├── utils.jl          # weight initializers (glorot_uniform, kaiming_normal, …), nfan
+├── outputsize.jl     # @autosize macro, layer output shape inference
+├── loading.jl        # model state loading/saving
+├── devices.jl        # Flux.get_device (retrocompat wrapper)
+├── layers/
+│   ├── macro.jl      # @layer macro
+│   ├── basic.jl      # Dense, Chain, Parallel, SkipConnection, Embedding, …
+│   ├── conv.jl       # Conv, ConvTranspose, DepthwiseConv, pooling layers
+│   ├── recurrent.jl  # RNNCell/RNN, LSTMCell/LSTM, GRUCell/GRU, Recurrence
+│   ├── normalise.jl  # BatchNorm, LayerNorm, InstanceNorm, GroupNorm, WeightNorm
+│   ├── attention.jl  # Attention
+│   └── upsample.jl   # Upsample, PixelShuffle
+├── losses/
+│   └── functions.jl  # mse, crossentropy, focal_loss, kldivergence, …
+└── distributed/      # MPIBackend, NCCLBackend, DistributedUtils
+```
+
+### Extension System
+
+Optional backends live in `ext/` as Julia package extensions (weak dependencies):
+
+| Extension | Trigger package(s) | Purpose |
+|---|---|---|
+| `FluxCUDAExt` | CUDA.jl | NVIDIA GPU support |
+| `FluxCUDAcuDNNExt` | CUDA.jl + cuDNN.jl | cuDNN-accelerated kernels |
+| `FluxAMDGPUExt` | AMDGPU.jl | AMD GPU support |
+| `FluxEnzymeExt` | Enzyme.jl | Enzyme AD backend |
+| `FluxMooncakeExt` | Mooncake.jl | Mooncake AD backend |
+| `FluxFiniteDifferencesExt` | FiniteDifferences.jl | FiniteDifferences AD backend |
+| `FluxMPIExt` | MPI.jl | Distributed training |
+| `FluxMPINCCLExt` | CUDA.jl + MPI.jl + NCCL.jl | NCCL all-reduce |
+
+### Test Layout
+
+Tests mirror the source structure. [test/test_module.jl](test/test_module.jl) provides `test_gradients`, which checks a layer's gradient against a reference AD backend, on CPU or GPU. By default it compares Zygote and, unless `FLUX_TEST_ENZYME=false`, Enzyme; pass `compare=` to choose the backends (e.g. to split out a backend that is broken for one call). GPU call sites pass `compare=nothing`, which tests the `reference` backend (Zygote) on GPU. [test/testsuite/normalization.jl](test/testsuite/normalization.jl) is a reusable test suite run for each device backend.
+
+`ParallelTestRunner` runs each test file in an isolated anonymous module. Test files have **no imports of their own** — all names come from `init_code` in `runtests.jl`, which includes [test/test_module.jl](test/test_module.jl). Symbols that are `public` but not `export`ed in Flux (e.g. `outputsize`) are **not** brought into scope by `using Flux` alone; add them to the explicit `using Flux: ...` line in `test_module.jl` if a test file needs them.
+
+## GitHub Repository
+
+**Repo:** https://github.com/FluxML/Flux.jl (under the `FluxML` org)
+
+**CI systems:**
+- **GitHub Actions** (`.github/workflows/ci.yml`): CPU tests on Julia 1.10 (minimum), latest stable, and nightly; platforms: Ubuntu x64, Windows x64, macOS aarch64. These run with `FLUX_TEST_REACTANT=false`; the Reactant tests (`ext_reactant`) run in a separate job on Ubuntu x64, Julia latest stable, the only job that installs Reactant.
+- **Buildkite** (`.buildkite/pipeline.yml`): GPU tests on JuliaGPU infrastructure — CUDA (Julia 1), Reactant on CUDA (Julia 1, a separate job running only `ext_reactant`), Metal (macOS aarch64), AMDGPU (ROCm). These run with `FLUX_TEST_CPU=false` and the relevant GPU flag set to `true`.
+
+**PR checklist** (from open PRs convention): tests added, documentation updated if applicable. No `NEWS.md` entry (see [Changelog](#changelog-newsmd)); put the user-facing summary in the PR description instead, so it can be copied into `NEWS.md` at release time.
